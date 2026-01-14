@@ -149,6 +149,7 @@ Automated high-frequency momentum trading bot for BTC perpetuals on Paradex (pri
 btc-momentum-bot/
 ├── claude.md                         # This file - project tracking
 ├── MASTER_PLAN.md                    # Comprehensive execution plan for Ralph
+├── INTEGRATION_GUIDE.md              # Exchange API integration documentation
 ├── requirements.txt                  # Python dependencies
 ├── runbot.py                         # Main bot entry point
 ├── config/
@@ -196,8 +197,21 @@ btc-momentum-bot/
 - Verified paper trading framework runs correctly
 - **STATUS: PHASE 1 COMPLETE - Ready for exchange integration**
 
+### 2026-01-14 (Session 4 - Exchange Integration Research)
+- Researched Paradex API: `paradex-py` SDK, L1+L2 authentication, WebSocket channels
+- Researched Lighter API: `lighter-v2-python` SDK, SignerClient auth, order types
+- Created comprehensive `INTEGRATION_GUIDE.md` with:
+  - Full authentication setup for both exchanges
+  - Market data endpoints
+  - Order placement examples
+  - WebSocket subscription patterns
+  - Bot skeleton code templates
+  - Implementation checklist
+- Updated `requirements.txt` with exchange SDKs
+- **STATUS: Integration documentation complete**
+
 ### Remaining Work for Phase 2 (Live Deployment)
-1. Integrate perp-dex-toolkit for Paradex/Lighter API
+1. ~~Integrate perp-dex-toolkit for Paradex/Lighter API~~ **DONE** - See INTEGRATION_GUIDE.md
 2. Implement real-time price feed
 3. Connect strategy signals to order execution
 4. Paper trade with live data for 24+ hours
