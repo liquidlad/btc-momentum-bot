@@ -1,0 +1,89 @@
+{
+  "primary_exchange": "paradex",
+  "secondary_exchange": "lighter",
+
+  "paradex": {
+    "name": "Paradex",
+    "enabled": true,
+    "base_url": "https://api.paradex.trade",
+    "ws_url": "wss://ws.api.paradex.trade",
+    "chain": "starknet",
+    "fees": {
+      "maker": 0.0,
+      "taker": 0.0
+    },
+    "leverage": {
+      "btc_max": 50,
+      "default": 20
+    },
+    "markets": {
+      "btc": "BTC-USD-PERP"
+    },
+    "credentials": {
+      "l1_address": "${PARADEX_L1_ADDRESS}",
+      "l2_private_key": "${PARADEX_L2_PRIVATE_KEY}"
+    },
+    "rate_limits": {
+      "requests_per_second": 10,
+      "orders_per_second": 5
+    },
+    "order_types": ["market", "limit", "stop_loss", "take_profit"],
+    "min_order_size": 0.001,
+    "price_precision": 1,
+    "size_precision": 3
+  },
+
+  "lighter": {
+    "name": "Lighter",
+    "enabled": true,
+    "base_url": "https://mainnet.zklighter.elliot.ai",
+    "api_docs": "https://apidocs.lighter.xyz",
+    "chain": "zk-rollup",
+    "fees": {
+      "maker": 0.0,
+      "taker": 0.0,
+      "premium_maker": 0.00002,
+      "premium_taker": 0.0002
+    },
+    "leverage": {
+      "btc_max": 50,
+      "eth_max": 50,
+      "alts_max": 15,
+      "default": 20
+    },
+    "markets": {
+      "btc": "BTC/USDC"
+    },
+    "credentials": {
+      "account_index": "${LIGHTER_ACCOUNT_INDEX}",
+      "api_key_index": "${LIGHTER_API_KEY_INDEX}",
+      "private_key": "${API_KEY_PRIVATE_KEY}"
+    },
+    "rate_limits": {
+      "requests_per_second": 5,
+      "orders_per_second": 3
+    },
+    "latency": {
+      "standard_maker_ms": 200,
+      "standard_taker_ms": 300,
+      "premium_maker_ms": 0,
+      "premium_taker_ms": 150
+    },
+    "order_types": ["market", "limit", "post_only", "reduce_only", "ioc", "gtt", "stop_loss", "take_profit", "twap"],
+    "min_order_size": 0.001,
+    "price_precision": 1,
+    "size_precision": 4
+  },
+
+  "data_sources": {
+    "historical": {
+      "primary": "binance",
+      "fallback": "paradex"
+    },
+    "binance": {
+      "base_url": "https://api.binance.com/api/v3",
+      "symbol": "BTCUSDT",
+      "rate_limit": 1200
+    }
+  }
+}

@@ -1,0 +1,90 @@
+{
+  "strategy_name": "momentum_burst_scalper",
+  "version": "1.0",
+
+  "indicator_sets": {
+    "ema_rsi_volume": {
+      "enabled": true,
+      "params": {
+        "ema_fast": 9,
+        "ema_slow": 21,
+        "rsi_period": 14,
+        "rsi_long_min": 35,
+        "rsi_long_max": 65,
+        "rsi_short_min": 35,
+        "rsi_short_max": 65,
+        "roc_period": 3,
+        "roc_threshold": 0.10,
+        "volume_sma_period": 20,
+        "volume_multiplier": 1.5
+      }
+    },
+    "vwap_deviation": {
+      "enabled": true,
+      "params": {
+        "vwap_anchor": "daily",
+        "entry_deviation_pct": 0.15,
+        "exit_deviation_pct": 0.08,
+        "volume_confirmation": true
+      }
+    },
+    "price_action": {
+      "enabled": true,
+      "params": {
+        "breakout_period": 10,
+        "atr_period": 14,
+        "atr_stop_multiplier": 0.5,
+        "engulfing_filter": true,
+        "momentum_bar_threshold": 1.5
+      }
+    }
+  },
+
+  "entry_rules": {
+    "min_conditions_met": 4,
+    "max_conditions": 5,
+    "require_candle_confirmation": true,
+    "long": {
+      "momentum_aligned": "ema_fast > ema_slow",
+      "acceleration": "roc > roc_threshold",
+      "volume_surge": "volume > volume_sma * volume_multiplier",
+      "rsi_filter": "rsi_long_min < rsi < rsi_long_max",
+      "candle_bullish": "close > open"
+    },
+    "short": {
+      "momentum_aligned": "ema_fast < ema_slow",
+      "acceleration": "roc < -roc_threshold",
+      "volume_surge": "volume > volume_sma * volume_multiplier",
+      "rsi_filter": "rsi_short_min < rsi < rsi_short_max",
+      "candle_bearish": "close < open"
+    }
+  },
+
+  "exit_rules": {
+    "stop_loss_pct": 0.10,
+    "take_profit_1_pct": 0.08,
+    "take_profit_1_close_pct": 50,
+    "take_profit_2_pct": 0.15,
+    "take_profit_2_close_pct": 50,
+    "trailing_stop_pct": 0.05,
+    "trailing_activation_pct": 0.08,
+    "max_hold_candles": 10,
+    "time_exit_if_not_profitable_candles": 5
+  },
+
+  "timeframes": {
+    "primary": "1m",
+    "confirmation": "5m",
+    "use_multi_timeframe": false
+  },
+
+  "optimization_ranges": {
+    "ema_fast": [5, 9, 12],
+    "ema_slow": [15, 21, 26],
+    "rsi_period": [7, 14, 21],
+    "roc_threshold": [0.08, 0.10, 0.12, 0.15],
+    "volume_multiplier": [1.2, 1.5, 2.0],
+    "stop_loss_pct": [0.08, 0.10, 0.12],
+    "take_profit_1_pct": [0.06, 0.08, 0.10]
+  }
+}
