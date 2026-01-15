@@ -268,8 +268,24 @@ Leverage:       50x
 Max Position:   $10,000
 Volume Target:  $200,000/day
 Stop Loss:      0.10%
-Take Profit:    0.08% / 0.15%
+Take Profit:    0.12% (optimized)
 Max Drawdown:   25%
+```
+
+### How to Run the Bot
+
+```bash
+# Paper trading (recommended first)
+python runbot.py --exchange paradex --ticker BTC --paper
+
+# Paper trading on Lighter
+python runbot.py --exchange lighter --ticker BTC --paper
+
+# Run integration tests
+python test_integration.py
+
+# Live trading (requires credentials in environment)
+python runbot.py --exchange paradex --ticker BTC
 ```
 
 ### Commands for Ralph
