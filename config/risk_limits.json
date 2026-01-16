@@ -1,24 +1,24 @@
 {
   "capital": {
-    "initial": 200,
+    "initial": 50,
     "currency": "USDC"
   },
 
   "leverage": {
     "max": 50,
-    "default": 50,
+    "default": 20,
     "reduce_on_drawdown": true
   },
 
   "targets": {
     "daily_volume_multiplier": 1000,
-    "daily_volume_target": 200000,
+    "daily_volume_target": 50000,
     "min_daily_profit_pct": 0.1,
     "target_trades_per_day": 144
   },
 
   "position_limits": {
-    "max_position_notional": 10000,
+    "max_position_notional": 1000,
     "max_position_pct_of_leverage": 100,
     "max_open_positions": 1,
     "risk_per_trade_pct": 2.0

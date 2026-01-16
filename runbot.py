@@ -35,6 +35,10 @@ from datetime import datetime, timedelta
 from typing import Optional
 import logging
 
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
 # Setup path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -152,6 +156,9 @@ class MomentumBot:
             # Add trade callback for logging
             self.strategy.add_trade_callback(self._on_trade_event)
 
+            # Bootstrap with historical candles from Binance
+            await self._bootstrap_candles()
+
             self.logger.info("Setup complete")
             return True
 
@@ -167,6 +174,41 @@ class MomentumBot:
             self.logger.info(f"Trade opened: {data.side} @ {data.entry_price:.2f}")
         elif event_type == "close":
             self.logger.info(f"Trade closed: P&L ${data.pnl:.2f} ({data.pnl_pct:.2f}%)")
+
+    async def _bootstrap_candles(self) -> None:
+        """Fetch historical candles from Binance to bootstrap strategy immediately."""
+        import requests
+
+        # Map ticker to Binance symbol
+        symbol_map = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT"}
+        symbol = symbol_map.get(self.ticker, f"{self.ticker}USDT")
+
+        try:
+            self.logger.info(f"Fetching historical candles for {symbol}...")
+            url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=25"
+            response = requests.get(url, timeout=10)
+            data = response.json()
+
+            if not data or not isinstance(data, list):
+                self.logger.warning("Could not fetch historical candles, starting fresh")
+                return
+
+            # Feed candles to strategy (skip last one as it's incomplete)
+            for kline in data[:-1]:
+                candle = {
+                    "timestamp": int(kline[0]),
+                    "open": float(kline[1]),
+                    "high": float(kline[2]),
+                    "low": float(kline[3]),
+                    "close": float(kline[4]),
+                    "volume": float(kline[5]),
+                }
+                await self.strategy.on_candle_close(candle)
+
+            self.logger.info(f"Bootstrapped with {len(data)-1} historical candles - READY TO TRADE!")
+
+        except Exception as e:
+            self.logger.warning(f"Could not bootstrap candles: {e}, starting fresh")
 
     async def run(self) -> None:
         """Main bot loop."""
@@ -282,8 +324,9 @@ class MomentumBot:
             self.logger.info("=" * 60)
             self.logger.info("FINAL STATISTICS")
             self.logger.info("=" * 60)
+            initial_capital = self.risk_config.get("capital", {}).get("initial", 50)
             self.logger.info(f"Final Equity: ${stats['equity']:.2f}")
-            self.logger.info(f"Total P&L: ${stats['equity'] - 200:.2f}")
+            self.logger.info(f"Total P&L: ${stats['equity'] - initial_capital:.2f}")
             self.logger.info(f"Total Trades: {stats['total_trades']}")
             self.logger.info(f"Win Rate: {stats['win_rate']:.1f}%")
             self.logger.info(f"Max Drawdown: {stats['max_drawdown_pct']:.2f}%")

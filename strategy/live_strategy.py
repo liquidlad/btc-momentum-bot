@@ -89,7 +89,7 @@ class LiveStrategy:
         exchange_client,
         strategy_params: dict,
         risk_params: dict,
-        candle_window: int = 100,
+        candle_window: int = 20,
     ):
         """
         Initialize live strategy.
@@ -105,8 +105,9 @@ class LiveStrategy:
         self.risk = risk_params
         self.candle_window = candle_window
 
-        # State
-        self.state = StrategyState()
+        # State - use capital from risk config
+        initial_capital = risk_params.get("capital", {}).get("initial", 50)
+        self.state = StrategyState(equity=initial_capital, peak_equity=initial_capital)
         self.candles: deque = deque(maxlen=candle_window)
         self.last_signal = 0
         self.last_candle_time: Optional[datetime] = None
@@ -254,11 +255,20 @@ class LiveStrategy:
         """Open a new position."""
         side = "LONG" if signal == 1 else "SHORT"
 
-        # Calculate position size
-        position_size = self._calculate_position_size()
-        if position_size <= 0:
+        # Calculate position size (returns notional in USD)
+        position_notional = self._calculate_position_size()
+        if position_notional <= 0:
             logger.warning("Position size is 0, skipping trade")
             return
+
+        # Convert notional to asset units (e.g., $1000 / $95000 = 0.0105 BTC)
+        position_size = position_notional / price
+
+        # Round to reasonable precision for the asset
+        # BTC: 5 decimals, ETH: 4 decimals, SOL: 2 decimals
+        position_size = round(position_size, 5)
+
+        logger.info(f"Position sizing: ${position_notional:.2f} notional / ${price:.2f} = {position_size} units")
 
         # Calculate stop loss and take profit prices
         stop_loss_pct = self.params.get("stop_loss_pct", 0.10) / 100

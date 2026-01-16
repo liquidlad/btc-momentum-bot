@@ -42,7 +42,7 @@ class ParadexClient(ExchangeClient):
         self._order_callbacks: List[Callable] = []
 
         # Paper trading state
-        self._paper_balance = 200.0
+        self._paper_balance = 50.0
         self._paper_position: Optional[Position] = None
         self._paper_orders: List[Order] = []
         self._last_bbo: Optional[BBO] = None
@@ -58,12 +58,11 @@ class ParadexClient(ExchangeClient):
             # Import Paradex SDK
             try:
                 from paradex_py import Paradex, ParadexSubkey
-                from paradex_py.environment import Environment
             except ImportError:
                 logger.error("paradex-py not installed. Run: pip install paradex-py")
                 return False
 
-            env = Environment.TESTNET if self.use_testnet else Environment.PROD
+            env = "testnet" if self.use_testnet else "prod"
 
             # Try L2-only auth first (preferred for bots)
             l2_private_key = os.environ.get("PARADEX_L2_PRIVATE_KEY")
@@ -98,6 +97,8 @@ class ParadexClient(ExchangeClient):
 
         except Exception as e:
             logger.error(f"Paradex connection failed: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     async def disconnect(self) -> None:
@@ -129,9 +130,9 @@ class ParadexClient(ExchangeClient):
         try:
             bbo_data = self.paradex.api_client.fetch_bbo(self.market)
             return BBO(
-                bid_price=float(bbo_data.get("bid_price", 0)),
+                bid_price=float(bbo_data.get("bid", 0)),
                 bid_size=float(bbo_data.get("bid_size", 0)),
-                ask_price=float(bbo_data.get("ask_price", 0)),
+                ask_price=float(bbo_data.get("ask", 0)),
                 ask_size=float(bbo_data.get("ask_size", 0)),
                 timestamp=int(time.time() * 1000)
             )
@@ -369,14 +370,15 @@ class ParadexClient(ExchangeClient):
 
         try:
             from paradex_py.common.order import Order as ParadexOrder, OrderSide as PSide, OrderType as PType
+            from decimal import Decimal
 
             order_obj = ParadexOrder(
                 market=self.market,
-                side=PSide.BUY if side == OrderSide.BUY else PSide.SELL,
-                type=PType.LIMIT if order_type == OrderType.LIMIT else PType.MARKET,
-                size=str(size),
-                price=str(price) if price else None,
-                client_id=client_id
+                order_type=PType.Limit if order_type == OrderType.LIMIT else PType.Market,
+                order_side=PSide.Buy if side == OrderSide.BUY else PSide.Sell,
+                size=Decimal(str(size)),
+                limit_price=Decimal(str(price)) if price else Decimal("0"),
+                client_id=client_id or ""
             )
 
             result = self.paradex.api_client.submit_order(order_obj)
