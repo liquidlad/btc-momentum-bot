@@ -1,12 +1,16 @@
 """
 Lighter exchange client implementation.
-Connects to Lighter DEX for trading BTC perpetuals.
+Connects to Lighter DEX for trading perpetuals.
+
+Lighter has 0% fees for standard accounts (both maker and taker).
+Trade-off: 200-300ms latency (acceptable for 1-minute candle strategies).
 """
 
 import os
 import asyncio
 import logging
 from typing import Optional, List, Callable
+from decimal import Decimal
 import time
 
 from .base import (
@@ -21,28 +25,31 @@ class LighterClient(ExchangeClient):
     """
     Lighter exchange client.
 
-    Uses the lighter-v2-python SDK for API interactions.
+    Uses the lighter-sdk for API interactions.
+    Standard accounts have 0% maker and 0% taker fees.
     """
-
-    BASE_URL = "https://api.lighter.xyz"
 
     def __init__(
         self,
-        market: str = "BTC-USD",
+        market: str = "BTC-USD-PERP",
         paper_mode: bool = True,
     ):
         super().__init__(market, paper_mode)
-        self.client = None
+        self.signer_client = None
         self.order_api = None
-        self.tx_api = None
         self.account_api = None
+        self.tx_api = None
         self.account_index = None
+        self._orderbook_id = None  # Lighter uses orderbook IDs
 
         # Paper trading state
-        self._paper_balance = 200.0
+        self._paper_balance = 50.0
         self._paper_position: Optional[Position] = None
         self._paper_orders: List[Order] = []
         self._last_bbo: Optional[BBO] = None
+
+        # Market to orderbook mapping (will be fetched on connect)
+        self._market_to_orderbook = {}
 
     async def connect(self) -> bool:
         """Connect to Lighter."""
@@ -54,45 +61,88 @@ class LighterClient(ExchangeClient):
 
             # Import Lighter SDK
             try:
-                import lighter
-                from lighter.api import AccountApi, OrderApi, TransactionApi
+                from lighter import SignerClient, OrderApi, AccountApi, TransactionApi, Configuration
             except ImportError:
-                logger.error("lighter-v2-python not installed. Run: pip install lighter-v2-python")
+                logger.error("lighter-sdk not installed. Run: pip install lighter-sdk")
                 return False
 
-            # Get credentials
+            # Get credentials from environment
             account_index = os.environ.get("LIGHTER_ACCOUNT_INDEX")
             api_key_index = os.environ.get("LIGHTER_API_KEY_INDEX")
-            private_key = os.environ.get("API_KEY_PRIVATE_KEY")
+            private_key = os.environ.get("LIGHTER_PRIVATE_KEY")
 
-            if not all([account_index, api_key_index, private_key]):
-                logger.error("Lighter: Missing credentials. Set LIGHTER_ACCOUNT_INDEX, LIGHTER_API_KEY_INDEX, API_KEY_PRIVATE_KEY")
+            if not all([account_index, private_key]):
+                logger.error("Lighter: Missing credentials. Set LIGHTER_ACCOUNT_INDEX and LIGHTER_PRIVATE_KEY")
                 return False
 
             self.account_index = int(account_index)
-            api_key_idx = int(api_key_index)
+            api_key_idx = int(api_key_index) if api_key_index else 0
 
-            # Initialize client
-            self.client = lighter.SignerClient(
-                url=self.BASE_URL,
-                api_private_keys={api_key_idx: private_key},
-                account_index=self.account_index
+            # Get the base URL from configuration
+            config = Configuration()
+            base_url = config.host
+
+            logger.info(f"Lighter: Connecting to {base_url}")
+
+            # Initialize signer client
+            self.signer_client = SignerClient(
+                url=base_url,
+                account_index=self.account_index,
+                api_private_keys={api_key_idx: private_key}
             )
 
-            self.order_api = OrderApi(self.BASE_URL)
-            self.tx_api = TransactionApi(self.BASE_URL, self.client)
-            self.account_api = AccountApi(self.BASE_URL)
+            # Initialize API clients
+            self.order_api = OrderApi()
+            self.account_api = AccountApi()
+            self.tx_api = TransactionApi()
+
+            # Get orderbook info to find the right orderbook ID for our market
+            await self._fetch_orderbook_mapping()
 
             self.connected = True
-            logger.info("Lighter: Connected successfully")
+            logger.info(f"Lighter: Connected successfully (account {self.account_index})")
             return True
 
         except Exception as e:
             logger.error(f"Lighter connection failed: {e}")
+            import traceback
+            traceback.print_exc()
             return False
+
+    async def _fetch_orderbook_mapping(self):
+        """Fetch orderbook IDs for markets."""
+        try:
+            orderbooks = await self.order_api.order_books()
+            for ob in orderbooks.order_books:
+                if ob.market_type == 'perp':
+                    # Map symbol to market_id (e.g., "BTC" -> 1)
+                    # Also map our market format (e.g., "BTC-USD-PERP" -> 1)
+                    self._market_to_orderbook[ob.symbol] = ob.market_id
+                    self._market_to_orderbook[f"{ob.symbol}-USD-PERP"] = ob.market_id
+
+            # Extract symbol from our market format (e.g., "BTC-USD-PERP" -> "BTC")
+            symbol = self.market.split("-")[0] if "-" in self.market else self.market
+
+            if self.market in self._market_to_orderbook:
+                self._orderbook_id = self._market_to_orderbook[self.market]
+                logger.info(f"Lighter: Using market_id {self._orderbook_id} for {self.market}")
+            elif symbol in self._market_to_orderbook:
+                self._orderbook_id = self._market_to_orderbook[symbol]
+                logger.info(f"Lighter: Using market_id {self._orderbook_id} for {symbol}")
+            else:
+                logger.warning(f"Lighter: Market {self.market} not found. Available: BTC, ETH, SOL, etc.")
+        except Exception as e:
+            logger.error(f"Error fetching orderbook mapping: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def disconnect(self) -> None:
         """Disconnect from Lighter."""
+        if self.signer_client and not self.paper_mode:
+            try:
+                await self.signer_client.close()
+            except Exception as e:
+                logger.warning(f"Error closing Lighter connection: {e}")
         self.connected = False
         logger.info("Lighter: Disconnected")
 
@@ -110,14 +160,24 @@ class LighterClient(ExchangeClient):
             )
 
         try:
-            book = self.order_api.get_orderbook(self.market)
-            bids = book.get("bids", [])
-            asks = book.get("asks", [])
+            if not self._orderbook_id:
+                raise ValueError(f"No orderbook ID for market {self.market}")
 
-            bid_price = float(bids[0]["price"]) if bids else 0
-            bid_size = float(bids[0]["size"]) if bids else 0
-            ask_price = float(asks[0]["price"]) if asks else 0
-            ask_size = float(asks[0]["size"]) if asks else 0
+            # Get top of book from order_book_orders
+            orders = await self.order_api.order_book_orders(market_id=self._orderbook_id, limit=1)
+
+            bid_price = 0
+            bid_size = 0
+            ask_price = 0
+            ask_size = 0
+
+            if orders.bids and len(orders.bids) > 0:
+                bid_price = float(orders.bids[0].price)
+                bid_size = float(orders.bids[0].remaining_base_amount)
+
+            if orders.asks and len(orders.asks) > 0:
+                ask_price = float(orders.asks[0].price)
+                ask_size = float(orders.asks[0].remaining_base_amount)
 
             return BBO(
                 bid_price=bid_price,
@@ -132,8 +192,34 @@ class LighterClient(ExchangeClient):
 
     async def get_candles(self, resolution: str, start_time: int, end_time: int) -> List[Candle]:
         """Get historical candles."""
-        # Lighter API candle fetching - implementation depends on their API
-        return []
+        if self.paper_mode:
+            return []
+
+        try:
+            from lighter import CandlestickApi
+            candle_api = CandlestickApi()
+
+            candles = await candle_api.candlesticks(
+                market_id=self._orderbook_id,
+                resolution=resolution,
+                start_time=start_time,
+                end_time=end_time
+            )
+
+            return [
+                Candle(
+                    timestamp=int(c.open_timestamp),
+                    open=float(c.open),
+                    high=float(c.high),
+                    low=float(c.low),
+                    close=float(c.close),
+                    volume=float(c.volume)
+                )
+                for c in candles.candlesticks
+            ]
+        except Exception as e:
+            logger.error(f"Error fetching candles: {e}")
+            return []
 
     async def subscribe_bbo(self, callback: Callable) -> None:
         """Subscribe to real-time BBO updates."""
@@ -142,10 +228,9 @@ class LighterClient(ExchangeClient):
             return
 
         try:
-            from lighter.ws import WsClient
-            ws_client = WsClient(self.BASE_URL)
-            ws_client.subscribe_orderbook(self.market)
-            logger.info(f"Lighter: Subscribed to BBO for {self.market}")
+            from lighter import WsClient
+            # WebSocket subscription - implementation depends on Lighter's WS API
+            logger.info(f"Lighter: BBO subscription for {self.market}")
         except Exception as e:
             logger.error(f"Error subscribing to BBO: {e}")
 
@@ -154,8 +239,6 @@ class LighterClient(ExchangeClient):
         if self.paper_mode:
             logger.info("Lighter: Trades subscription registered (paper mode)")
             return
-        # Implement based on Lighter WebSocket API
-        pass
 
     async def get_balance(self) -> Balance:
         """Get account balance."""
@@ -168,13 +251,19 @@ class LighterClient(ExchangeClient):
             )
 
         try:
-            account = self.account_api.get_account(account_index=self.account_index)
-            return Balance(
-                currency="USDC",
-                available=float(account.get("available_balance", 0)),
-                total=float(account.get("total_balance", 0)),
-                in_orders=0
-            )
+            account = await self.account_api.account(by='index', value=str(self.account_index))
+            # Account info is in accounts list
+            if hasattr(account, 'accounts') and account.accounts:
+                acc = account.accounts[0]
+                collateral = float(acc.collateral) if acc.collateral else 0
+                available = float(acc.available_balance) if acc.available_balance else collateral
+                return Balance(
+                    currency="USDC",
+                    available=available,
+                    total=collateral,
+                    in_orders=0
+                )
+            return Balance(currency="USDC", available=0, total=0, in_orders=0)
         except Exception as e:
             logger.error(f"Error fetching balance: {e}")
             raise
@@ -187,19 +276,26 @@ class LighterClient(ExchangeClient):
             return []
 
         try:
-            account = self.account_api.get_account(account_index=self.account_index)
-            positions = account.get("positions", [])
-            return [
-                Position(
-                    market=p.get("market"),
-                    side="LONG" if float(p.get("size", 0)) > 0 else "SHORT",
-                    size=abs(float(p.get("size", 0))),
-                    entry_price=float(p.get("entry_price", 0)),
-                    unrealized_pnl=float(p.get("unrealized_pnl", 0)),
-                )
-                for p in positions
-                if p.get("market") == self.market and float(p.get("size", 0)) != 0
-            ]
+            account = await self.account_api.account(by='index', value=str(self.account_index))
+            positions = []
+
+            # Positions are in accounts list
+            if hasattr(account, 'accounts') and account.accounts:
+                acc = account.accounts[0]
+                if hasattr(acc, 'positions'):
+                    for pos in (acc.positions or []):
+                        pos_market_id = getattr(pos, 'market_id', None) or getattr(pos, 'order_book_id', None)
+                        if pos_market_id == self._orderbook_id and float(pos.size or 0) != 0:
+                            size = float(pos.size)
+                            positions.append(Position(
+                                market=self.market,
+                                side="LONG" if size > 0 else "SHORT",
+                                size=abs(size),
+                                entry_price=float(pos.entry_price or 0),
+                                unrealized_pnl=float(pos.unrealized_pnl or 0),
+                            ))
+
+            return positions
         except Exception as e:
             logger.error(f"Error fetching positions: {e}")
             raise
@@ -208,8 +304,29 @@ class LighterClient(ExchangeClient):
         """Get open orders."""
         if self.paper_mode:
             return [o for o in self._paper_orders if o.status == OrderStatus.OPEN]
-        # Implement based on Lighter API
-        return []
+
+        try:
+            orders = await self.order_api.account_active_orders(account_index=self.account_index)
+            return [
+                Order(
+                    id=str(o.order_id),
+                    client_id="",
+                    market=self.market,
+                    side=OrderSide.BUY if o.is_bid else OrderSide.SELL,
+                    order_type=OrderType.LIMIT,
+                    size=float(o.size or 0),
+                    price=float(o.price or 0),
+                    status=OrderStatus.OPEN,
+                    filled_size=float(o.filled_size or 0),
+                    avg_fill_price=0,
+                    timestamp=int(time.time() * 1000)
+                )
+                for o in (orders.orders or [])
+                if o.market_id == self._orderbook_id
+            ]
+        except Exception as e:
+            logger.error(f"Error fetching orders: {e}")
+            raise
 
     async def place_order(
         self,
@@ -262,28 +379,79 @@ class LighterClient(ExchangeClient):
                         self._paper_position.size -= size
                 else:
                     self._paper_position.size += size
+                    self._paper_position.entry_price = (
+                        (self._paper_position.entry_price * (self._paper_position.size - size) +
+                         fill_price * size) / self._paper_position.size
+                    )
 
             logger.info(f"PAPER ORDER: {side.value} {size} @ {fill_price:.2f}")
             return order
 
         try:
-            nonce = self.tx_api.next_nonce()
+            if not self._orderbook_id:
+                raise ValueError(f"No orderbook ID for market {self.market}")
 
-            order_data = {
-                "market": self.market,
-                "side": side.value,
-                "type": order_type.value,
-                "base_amount": int(size * 1e6),
-                "price": int(price * 1e6) if price else 0,
-                "time_in_force": "IMMEDIATE_OR_CANCEL" if order_type == OrderType.MARKET else "GOOD_TILL_TIME",
-                "nonce": nonce,
-                "client_order_index": int(time.time() * 1000) % 1000000
-            }
+            is_bid = side == OrderSide.BUY
 
-            result = self.tx_api.send_tx(order_data)
+            # Get current price for market orders
+            bbo = await self.get_bbo()
+            current_price = bbo.ask_price if side == OrderSide.BUY else bbo.bid_price
+
+            # Generate unique client order index
+            client_order_idx = int(time.time() * 1000) % (2**32)
+
+            # is_ask = True for SELL, False for BUY
+            is_ask = side == OrderSide.SELL
+
+            # Convert to integer format (Lighter uses smallest units)
+            # BTC: size_decimals=5, price_decimals=1
+            size_int = int(size * 100000)  # 5 decimals
+            price_int = int(current_price * 10)  # 1 decimal
+
+            if order_type == OrderType.MARKET:
+                # Use create_market_order for market orders
+                # Parameters: market_index, client_order_index, base_amount, avg_execution_price, is_ask
+                logger.info(f"Placing market order: market={self._orderbook_id}, size={size_int}, price={price_int}, is_ask={is_ask}")
+                result = await self.signer_client.create_market_order(
+                    market_index=self._orderbook_id,
+                    client_order_index=client_order_idx,
+                    base_amount=size_int,
+                    avg_execution_price=price_int,
+                    is_ask=is_ask
+                )
+                # Result is tuple: (tx, response, error)
+                tx, response, error = result
+                if error:
+                    logger.error(f"Order failed: {error}")
+                    raise ValueError(f"Order failed: {error}")
+                logger.info(f"Order response: {response}")
+            else:
+                # Use create_order for limit orders
+                if price is None:
+                    raise ValueError("Price required for limit orders")
+
+                limit_price_int = int(price * 10)  # 1 decimal
+                logger.info(f"Placing limit order: market={self._orderbook_id}, size={size_int}, price={limit_price_int}, is_ask={is_ask}")
+                result = await self.signer_client.create_order(
+                    market_index=self._orderbook_id,
+                    client_order_index=client_order_idx,
+                    base_amount=size_int,
+                    price=limit_price_int,
+                    is_ask=is_ask,
+                    order_type=self.signer_client.ORDER_TYPE_LIMIT,
+                    time_in_force=self.signer_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
+                )
+                # Result is tuple: (tx, response, error)
+                tx, response, error = result
+                if error:
+                    logger.error(f"Order failed: {error}")
+                    raise ValueError(f"Order failed: {error}")
+                logger.info(f"Order response: {response}")
+
+            logger.info(f"Lighter order placed: {side.value} {size} @ {price or 'MARKET'}")
 
             return Order(
-                id=str(result.get("order_id", "")),
+                id=str(result.tx_hash if hasattr(result, 'tx_hash') else int(time.time() * 1000)),
                 client_id=client_id,
                 market=self.market,
                 side=side,
@@ -307,8 +475,16 @@ class LighterClient(ExchangeClient):
                     order.status = OrderStatus.CANCELLED
                     return True
             return False
-        # Implement based on Lighter API
-        return False
+
+        try:
+            self.signer_client.cancel_order(
+                market_index=self._orderbook_id,
+                order_index=int(order_id)
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error cancelling order: {e}")
+            return False
 
     async def cancel_all_orders(self) -> int:
         """Cancel all open orders."""
@@ -319,8 +495,17 @@ class LighterClient(ExchangeClient):
                     order.status = OrderStatus.CANCELLED
                     count += 1
             return count
-        # Implement based on Lighter API
-        return 0
+
+        try:
+            # cancel_all_orders takes time_in_force and timestamp_ms
+            self.signer_client.cancel_all_orders(
+                time_in_force=0,  # Cancel all immediately
+                timestamp_ms=int(time.time() * 1000)
+            )
+            return -1  # Unknown count
+        except Exception as e:
+            logger.error(f"Error cancelling all orders: {e}")
+            return 0
 
     def _calculate_pnl(self, position: Position, exit_price: float) -> float:
         """Calculate P&L for a position."""

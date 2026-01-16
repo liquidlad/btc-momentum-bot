@@ -110,11 +110,8 @@ class MomentumBot:
         # Load configs
         self.risk_config = load_config("config/risk_limits.json")
 
-        # Determine market symbol
-        if exchange == "paradex":
-            self.market = f"{ticker}-USD-PERP"
-        else:  # lighter
-            self.market = f"{ticker}-USD"
+        # Determine market symbol (both exchanges use same format)
+        self.market = f"{ticker}-USD-PERP"
 
         self.logger.info(f"Initialized MomentumBot")
         self.logger.info(f"Exchange: {exchange}")
@@ -339,9 +336,13 @@ async def main_async(args) -> None:
     if args.config:
         config_path = args.config
     else:
-        # Auto-select based on ticker
+        # Auto-select based on exchange and ticker
         ticker_lower = args.ticker.lower()
-        if ticker_lower == "btc":
+
+        # Use Lighter-optimized params for Lighter exchange (0% fees = wider targets)
+        if args.exchange == "lighter":
+            config_path = "config/optimized_params_lighter.json"
+        elif ticker_lower == "btc":
             config_path = "config/optimized_params.json"
         elif ticker_lower == "eth":
             config_path = "config/optimized_params_eth.json"
@@ -428,8 +429,8 @@ Environment Variables (for live trading):
 
     Lighter:
         LIGHTER_ACCOUNT_INDEX - Account index
-        LIGHTER_API_KEY_INDEX - API key index
-        API_KEY_PRIVATE_KEY - API private key
+        LIGHTER_PRIVATE_KEY - Private key for signing
+        LIGHTER_API_KEY_INDEX - API key index (optional, defaults to 0)
         """
     )
 
@@ -490,7 +491,8 @@ Environment Variables (for live trading):
                 print("\nOr use --paper for paper trading.")
                 sys.exit(1)
         else:  # lighter
-            required_vars = ["LIGHTER_ACCOUNT_INDEX", "LIGHTER_API_KEY_INDEX", "API_KEY_PRIVATE_KEY"]
+            # Only account_index and private_key are required, api_key_index defaults to 0
+            required_vars = ["LIGHTER_ACCOUNT_INDEX", "LIGHTER_PRIVATE_KEY"]
             missing = [var for var in required_vars if not os.environ.get(var)]
             if missing:
                 print(f"Error: Missing Lighter credentials for live trading:")

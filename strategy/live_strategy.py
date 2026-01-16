@@ -264,9 +264,14 @@ class LiveStrategy:
         # Convert notional to asset units (e.g., $1000 / $95000 = 0.0105 BTC)
         position_size = position_notional / price
 
-        # Round to reasonable precision for the asset
-        # BTC: 5 decimals, ETH: 4 decimals, SOL: 2 decimals
-        position_size = round(position_size, 5)
+        # Round to exchange-required precision (must be multiple of step size)
+        # Paradex requires: BTC=4 decimals, ETH=4 decimals, SOL=2 decimals
+        market = getattr(self.exchange, 'market', '')
+        if 'SOL' in market:
+            position_size = round(position_size, 2)
+        else:
+            # BTC and ETH both require 4 decimal places (0.0001 step)
+            position_size = round(position_size, 4)
 
         logger.info(f"Position sizing: ${position_notional:.2f} notional / ${price:.2f} = {position_size} units")
 

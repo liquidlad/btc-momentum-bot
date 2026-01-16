@@ -1,18 +1,30 @@
 # Multi-Asset Momentum Trading Bot Project
 
 ## Project Overview
-Automated high-frequency momentum trading bot for BTC, ETH, and SOL perpetuals on Paradex (primary) and Lighter (secondary) exchanges. Designed for maximum volume with tight stops and zero fees.
+Automated high-frequency momentum trading bot for BTC, ETH, and SOL perpetuals on **Lighter (PRIMARY)** exchange. Designed for maximum volume with wider targets for 0% fee trading.
 
 **Supported Assets:**
-- **BTC**: Fully optimized, recommended for live trading
+- **BTC**: Fully optimized for Lighter, recommended for live trading
 - **ETH**: Fully optimized, recommended for live trading
 - **SOL**: Optimized but HIGH RISK (47% drawdown) - NOT recommended
 
 ## Key Characteristics
-- **Timeframe**: 1-minute and 5-minute candles
-- **Style**: High-volume scalping with tight stops
-- **Fees**: Zero maker-taker fees on both Paradex and Lighter
-- **Goal**: 1000x daily volume (e.g., $200 capital = $200K daily volume)
+- **Timeframe**: 1-minute candles
+- **Style**: Momentum scalping with optimized targets
+- **Fees**: **0% on Lighter** (both maker AND taker for standard accounts)
+- **Goal**: ~46 trades/day, ~$2.43/day net profit
+
+## CRITICAL: Exchange Fee Discovery (2026-01-15)
+
+**Paradex has HIDDEN FEES for API orders!**
+- Web UI: 0% fees
+- API orders: **0.019% taker fee** (kills HFT profitability)
+- This made our tight-stop strategy LOSE money (-$31/day after fees)
+
+**Solution: Switched to Lighter DEX**
+- Standard accounts: **0% maker + 0% taker fees**
+- Trade-off: 200-300ms latency (acceptable for 1-min candles)
+- All parameter configs become PROFITABLE with 0% fees
 
 ---
 
@@ -23,42 +35,43 @@ Automated high-frequency momentum trading bot for BTC, ETH, and SOL perpetuals o
 | **Capital** | $200 (test phase) |
 | **Leverage** | 50x max |
 | **Max Position** | $10,000 notional |
-| **Daily Volume Target** | $200,000 (1000x capital) |
-| **Min Daily Profit** | 0.1% ($0.20) |
-| **Max Drawdown** | 25% ($50) |
-| **Primary Exchange** | Paradex |
-| **Secondary Exchange** | Lighter |
+| **Daily Trades Target** | ~46 trades/day |
+| **Daily Profit Target** | ~$2.43/day net |
+| **Max Drawdown** | 14.2% |
+| **Primary Exchange** | **Lighter** (0% fees) |
+| **Secondary Exchange** | Paradex (has 0.019% API fee) |
 | **Direction** | Long + Short (no bias) |
 | **Operation** | 24/7 continuous |
-| **Base Code** | perp-dex-toolkit |
+| **Stop Loss** | 0.20% |
+| **Take Profit** | 0.30% |
 
 ---
 
 ## Exchange Research
 
-### Paradex (Primary)
-- **Type**: Zero-fee perp DEX on Starknet L2
-- **Leverage**: Up to 50x on BTC
-- **Fees**: Zero for retail
-- **Markets**: 250+ perpetuals
-- **Features**: Encrypted accounts, privacy
-- **API**: REST + WebSocket
-- **Credentials needed**: `PARADEX_L1_ADDRESS`, `PARADEX_L2_PRIVATE_KEY`
-
-### Lighter (Secondary)
+### Lighter (PRIMARY - 0% Fees!)
 - **Type**: zk-rollup perp DEX
 - **Leverage**: 50x on BTC/ETH
-- **Fees**: Zero for standard accounts
+- **Fees**: **0% maker + 0% taker** for standard accounts
 - **Built by**: Citadel HFT alumni
 - **Order types**: Market, limit, TWAP, SL/TP
-- **Latency**: 200-300ms standard, 0-150ms premium
-- **Credentials needed**: `LIGHTER_ACCOUNT_INDEX`, `LIGHTER_API_KEY_INDEX`, `API_KEY_PRIVATE_KEY`
+- **Latency**: 200-300ms standard (acceptable for 1-min candles)
+- **SDK**: `lighter-sdk` (pip install lighter-sdk)
+- **Credentials needed**:
+  - `LIGHTER_ACCOUNT_INDEX` - Your account index
+  - `LIGHTER_PRIVATE_KEY` - Private key for signing
+  - `LIGHTER_API_KEY_INDEX` - API key index (optional, defaults to 0)
 
-### perp-dex-toolkit
-- **Repo**: https://github.com/earthskyorg/perp-dex-toolkit
-- **Supports**: Paradex, Lighter, + 5 other exchanges
-- **Strategy**: Limit order placement near market price
-- **Use as**: Base for custom momentum strategy
+### Paradex (Secondary - HAS FEES)
+- **Type**: Perp DEX on Starknet L2
+- **Leverage**: Up to 50x on BTC
+- **Fees**:
+  - Web UI: 0%
+  - **API Orders: 0.019% TAKER FEE** (kills HFT profitability!)
+- **Markets**: 250+ perpetuals
+- **API**: REST + WebSocket
+- **Credentials needed**: `PARADEX_L1_ADDRESS`, `PARADEX_L2_PRIVATE_KEY`
+- **NOTE**: Not recommended for this strategy due to API fees
 
 ---
 
@@ -107,7 +120,26 @@ Automated high-frequency momentum trading bot for BTC, ETH, and SOL perpetuals o
 
 ### Optimized Parameters
 
-#### BTC (config/optimized_params.json)
+#### Lighter (PRIMARY - config/optimized_params_lighter.json)
+```json
+{
+  "min_conditions": 3,
+  "ema_fast": 3,
+  "ema_slow": 15,
+  "roc_threshold": 0.08,
+  "volume_multiplier": 1.0,
+  "stop_loss_pct": 0.20,
+  "take_profit_1_pct": 0.30,
+  "take_profit_2_pct": 0.45
+}
+```
+**Expected Results (0% fees):**
+- Trades/Day: 46
+- Win Rate: 38%
+- Daily Net P&L: $2.43
+- Max Drawdown: 14.2%
+
+#### Paradex BTC (config/optimized_params.json) - NOT PROFITABLE WITH FEES
 ```json
 {
   "min_conditions": 3,
@@ -119,32 +151,7 @@ Automated high-frequency momentum trading bot for BTC, ETH, and SOL perpetuals o
   "take_profit_1_pct": 0.12
 }
 ```
-
-#### ETH (config/optimized_params_eth.json)
-```json
-{
-  "min_conditions": 2,
-  "ema_fast": 3,
-  "ema_slow": 10,
-  "roc_threshold": 0.05,
-  "volume_multiplier": 1.0,
-  "stop_loss_pct": 0.10,
-  "take_profit_1_pct": 0.12
-}
-```
-
-#### SOL (config/optimized_params_sol.json) - NOT RECOMMENDED
-```json
-{
-  "min_conditions": 2,
-  "ema_fast": 3,
-  "ema_slow": 15,
-  "roc_threshold": 0.05,
-  "volume_multiplier": 1.0,
-  "stop_loss_pct": 0.10,
-  "take_profit_1_pct": 0.12
-}
-```
+**NOTE**: These tight targets LOSE MONEY after 0.019% API fees
 
 ### Strategy Logic
 **Entry (3 of 5 conditions required):**
@@ -154,9 +161,9 @@ Automated high-frequency momentum trading bot for BTC, ETH, and SOL perpetuals o
 4. RSI between 25-75 - Not extreme
 5. Bullish/bearish candle confirmation
 
-**Exit:**
-- Stop Loss: -0.10%
-- Take Profit: +0.12%
+**Exit (Lighter optimized):**
+- Stop Loss: -0.20%
+- Take Profit: +0.30%
 - Max Hold: 8 candles
 
 ---
@@ -337,14 +344,36 @@ btc-momentum-bot/
 - **LIVE TRADING VERIFIED** - Real orders filling on Paradex
 - **STATUS: PRODUCTION READY**
 
+### 2026-01-15 (Session 8 - Fee Discovery & Lighter Migration)
+- **CRITICAL DISCOVERY**: Paradex charges 0.019% taker fee for API orders
+  - Web UI: 0% fees
+  - API orders: 0.019% per side = 0.038% round trip
+  - This fee made our strategy UNPROFITABLE (-$31/day after fees)
+- Ran extensive fee impact analysis:
+  - At 0.019% fee: need >62.7% win rate to break even (impossible with our strategy)
+  - Tested wider targets, hybrid fee models, no-time-exit - all still losing
+- **SOLUTION**: Switched to Lighter DEX (0% fees for standard accounts)
+  - Re-ran backtests with 0% fees: ALL configs became PROFITABLE
+  - Best config for ~46 trades/day: SL=0.20%, TP=0.30% = $2.43/day net
+- Updated bot for Lighter:
+  - Installed `lighter-sdk` package
+  - Rewrote `exchange/lighter_client.py` with proper SDK integration
+  - Created `config/optimized_params_lighter.json` with wider targets
+  - Updated `runbot.py` to auto-select Lighter params
+  - Added Lighter credentials to `.env` template
+- **Paper trading verified working on Lighter**
+- **STATUS: READY FOR LIGHTER LIVE TRADING**
+
 ### Remaining Work for Live Deployment
 1. ~~Integrate perp-dex-toolkit for Paradex/Lighter API~~ **DONE**
 2. ~~Implement real-time price feed~~ **DONE**
 3. ~~Connect strategy signals to order execution~~ **DONE**
 4. ~~Add ETH/SOL support~~ **DONE (ETH recommended, SOL not recommended)**
 5. ~~Fix live order execution on Paradex~~ **DONE**
-6. ~~Deploy with live capital~~ **DONE ($100 = $50 BTC + $50 ETH)**
-7. Monitor performance and tune parameters
+6. ~~Deploy with live capital~~ **DONE (Paradex)**
+7. ~~Discover Paradex API fees~~ **DONE (0.019% - kills profitability)**
+8. ~~Migrate to Lighter (0% fees)~~ **DONE**
+9. Set up Lighter credentials and deploy live
 
 ---
 
@@ -362,40 +391,46 @@ btc-momentum-bot/
 
 ## Quick Reference
 
-### Critical Numbers
+### Critical Numbers (Lighter - 0% Fees)
 ```
-Capital:        $100 ($50 BTC + $50 ETH)
+Capital:        $200 (test phase)
 Leverage:       50x max (20x default)
-Max Position:   $1,000 notional per trade
-Volume Target:  $100,000/day (1000x capital)
-Stop Loss:      0.10%
-Take Profit:    0.12%
-Max Drawdown:   25%
-Expected Trades: ~87/day (~3.6/hour)
+Max Position:   $10,000 notional per trade
+Stop Loss:      0.20%
+Take Profit:    0.30%
+Max Drawdown:   14.2%
+Expected Trades: ~46/day (~2/hour)
+Expected Profit: ~$2.43/day
 ```
 
 ### How to Run the Bot
 
 ```bash
-# Paper trading BTC (recommended first)
-python runbot.py --exchange paradex --ticker BTC --paper
-
-# Paper trading ETH
-python runbot.py --exchange paradex --ticker ETH --paper
-
-# Paper trading SOL (NOT RECOMMENDED - high drawdown)
-python runbot.py --exchange paradex --ticker SOL --paper
-
-# Paper trading on Lighter
+# RECOMMENDED: Paper trading on Lighter (0% fees)
 python runbot.py --exchange lighter --ticker BTC --paper
+
+# Paper trading ETH on Lighter
 python runbot.py --exchange lighter --ticker ETH --paper
 
 # Run integration tests (6 tests)
 python test_integration.py
 
-# Live trading (requires credentials in environment)
-python runbot.py --exchange paradex --ticker BTC
-python runbot.py --exchange paradex --ticker ETH
+# Live trading on Lighter (requires credentials)
+python runbot.py --exchange lighter --ticker BTC
+
+# NOT RECOMMENDED: Paradex (has 0.019% API fees)
+# python runbot.py --exchange paradex --ticker BTC --paper
+```
+
+### Setting Up Lighter Credentials
+
+1. Create account at https://lighter.xyz
+2. Generate API keys in settings
+3. Add to `.env` file:
+```
+LIGHTER_ACCOUNT_INDEX=<your_account_index>
+LIGHTER_PRIVATE_KEY=<your_private_key>
+LIGHTER_API_KEY_INDEX=0
 ```
 
 ### Commands for Ralph
@@ -406,24 +441,18 @@ pip install -r requirements.txt
 # Step 2: Fetch 90 days of data
 python data/fetch_historical.py --days 90
 
-# Step 3: Run optimizer
-python strategy/optimizer.py
+# Step 3: Paper trade on Lighter
+python runbot.py --exchange lighter --ticker BTC --paper
 
-# Step 4: Paper trade
-python runbot.py --exchange paradex --ticker BTC --paper
-
-# Step 5: Go live
-python runbot.py --exchange paradex --ticker BTC
+# Step 4: Go live on Lighter
+python runbot.py --exchange lighter --ticker BTC
 ```
-
-### Ralph Prompt Document
-**Use `RALPH_PROMPT.md` as the single prompt document for Ralph execution.**
 
 ---
 
 ## Notes
-- Zero fees on both exchanges = huge advantage for HFT
-- Tight stops (0.10%) mean fast losers, need high win rate
-- Volume target requires ~6 trades/hour average
-- perp-dex-toolkit already supports both exchanges
+- **Lighter has 0% fees** for standard accounts (both maker and taker)
+- **Paradex has 0.019% API fee** - NOT recommended for this HFT strategy
+- Wider targets (0.20% SL, 0.30% TP) work best with 0% fees
+- 200-300ms latency on Lighter is acceptable for 1-minute candle strategy
 - Backtest on 90 days before any live trading

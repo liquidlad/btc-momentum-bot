@@ -42,8 +42,7 @@
     "fees": {
       "maker": 0.0,
       "taker": 0.0,
-      "premium_maker": 0.00002,
-      "premium_taker": 0.0002
+      "note": "Standard accounts have 0% fees - this is why we switched from Paradex"
     },
     "leverage": {
       "btc_max": 50,
@@ -52,22 +51,21 @@
       "default": 20
     },
     "markets": {
-      "btc": "BTC/USDC"
+      "btc": "BTC-USD-PERP",
+      "eth": "ETH-USD-PERP"
     },
     "credentials": {
       "account_index": "${LIGHTER_ACCOUNT_INDEX}",
       "api_key_index": "${LIGHTER_API_KEY_INDEX}",
-      "private_key": "${API_KEY_PRIVATE_KEY}"
+      "private_key": "${LIGHTER_PRIVATE_KEY}"
     },
     "rate_limits": {
       "requests_per_second": 5,
       "orders_per_second": 3
     },
     "latency": {
-      "standard_maker_ms": 200,
-      "standard_taker_ms": 300,
-      "premium_maker_ms": 0,
-      "premium_taker_ms": 150
+      "standard_ms": "200-300",
+      "note": "Acceptable for 1-minute candle strategies"
     },
     "order_types": ["market", "limit", "post_only", "reduce_only", "ioc", "gtt", "stop_loss", "take_profit", "twap"],
     "min_order_size": 0.001,
