@@ -160,7 +160,7 @@ class LighterClient(ExchangeClient):
             )
 
         try:
-            if not self._orderbook_id:
+            if self._orderbook_id is None:
                 raise ValueError(f"No orderbook ID for market {self.market}")
 
             # Get top of book from order_book_orders
@@ -388,7 +388,7 @@ class LighterClient(ExchangeClient):
             return order
 
         try:
-            if not self._orderbook_id:
+            if self._orderbook_id is None:
                 raise ValueError(f"No orderbook ID for market {self.market}")
 
             is_bid = side == OrderSide.BUY
