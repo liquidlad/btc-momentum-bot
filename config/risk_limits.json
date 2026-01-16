@@ -1,6 +1,6 @@
 {
   "capital": {
-    "initial": 50,
+    "initial": 35,
     "currency": "USDC"
   },
 
@@ -18,7 +18,7 @@
   },
 
   "position_limits": {
-    "max_position_notional": 1000,
+    "max_position_notional": 200,
     "max_position_pct_of_leverage": 100,
     "max_open_positions": 1,
     "risk_per_trade_pct": 2.0
