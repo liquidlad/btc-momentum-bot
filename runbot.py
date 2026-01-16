@@ -292,16 +292,32 @@ class MomentumBot:
 
 async def main_async(args) -> None:
     """Async main function."""
+    # Determine config file path
+    if args.config:
+        config_path = args.config
+    else:
+        # Auto-select based on ticker
+        ticker_lower = args.ticker.lower()
+        if ticker_lower == "btc":
+            config_path = "config/optimized_params.json"
+        elif ticker_lower == "eth":
+            config_path = "config/optimized_params_eth.json"
+        elif ticker_lower == "sol":
+            config_path = "config/optimized_params_sol.json"
+        else:
+            config_path = f"config/optimized_params_{ticker_lower}.json"
+
     # Load strategy config
     try:
-        config = load_config(args.config)
+        config = load_config(config_path)
         # Handle both flat and nested config formats
         if "optimized_params" in config:
             strategy_params = config["optimized_params"]
         else:
             strategy_params = config.get("indicator_sets", {}).get("ema_rsi_volume", {}).get("params", config)
+        print(f"Loaded strategy config from {config_path}")
     except FileNotFoundError:
-        print(f"Error: Config file not found: {args.config}")
+        print(f"Error: Config file not found: {config_path}")
         print("Using default parameters...")
         strategy_params = {
             "min_conditions": 3,
@@ -390,8 +406,8 @@ Environment Variables (for live trading):
     parser.add_argument(
         "--config",
         type=str,
-        default="config/optimized_params.json",
-        help="Path to strategy config file (default: config/optimized_params.json)"
+        default=None,
+        help="Path to strategy config file (default: auto-select based on ticker)"
     )
     parser.add_argument(
         "--paper",

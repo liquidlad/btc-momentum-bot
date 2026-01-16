@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Integration test for BTC Momentum Bot.
+Integration test for Multi-Asset Momentum Bot.
 Tests that Phase 1 strategy connects properly with Phase 2 exchange clients.
+Supports BTC, ETH, and SOL trading.
 """
 
 import asyncio
@@ -191,11 +192,95 @@ async def test_lighter_client():
     print("TEST 4 PASSED\n")
 
 
+async def test_multi_asset_configs():
+    """Test that all multi-asset configs exist and are valid."""
+    print("=" * 60)
+    print("TEST 5: Multi-Asset Configuration")
+    print("=" * 60)
+
+    assets = ["BTC", "ETH", "SOL"]
+    configs = {
+        "BTC": "config/optimized_params.json",
+        "ETH": "config/optimized_params_eth.json",
+        "SOL": "config/optimized_params_sol.json",
+    }
+
+    for asset in assets:
+        config_path = configs[asset]
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+            params = config.get("optimized_params", {})
+            metrics = config.get("expected_metrics", {})
+
+            print(f"\n{asset} Config ({config_path}):")
+            print(f"  min_conditions: {params.get('min_conditions')}")
+            print(f"  ema_fast/slow: {params.get('ema_fast')}/{params.get('ema_slow')}")
+            print(f"  stop_loss: {params.get('stop_loss_pct')}%")
+            print(f"  take_profit: {params.get('take_profit_1_pct')}%")
+            print(f"  Expected return: {metrics.get('total_return_pct', 'N/A')}%")
+            print(f"  Expected max DD: {metrics.get('max_drawdown_pct', 'N/A')}%")
+
+            assert "min_conditions" in params, f"Missing min_conditions in {asset} config"
+            assert "stop_loss_pct" in params, f"Missing stop_loss_pct in {asset} config"
+
+        except FileNotFoundError:
+            print(f"WARNING: {asset} config not found at {config_path}")
+
+    # Test portfolio config
+    try:
+        with open("config/portfolio_config.json") as f:
+            portfolio = json.load(f)
+        print(f"\nPortfolio Config:")
+        print(f"  Total capital: ${portfolio['portfolio_risk']['total_capital']}")
+        print(f"  Max portfolio DD: {portfolio['portfolio_risk']['max_portfolio_drawdown_pct']}%")
+        for asset, cfg in portfolio['assets'].items():
+            status = "ENABLED" if cfg['enabled'] else "DISABLED"
+            print(f"  {asset}: {status}, ${cfg['capital']} capital")
+    except FileNotFoundError:
+        print("WARNING: Portfolio config not found")
+
+    print("\nTEST 5 PASSED\n")
+
+
+async def test_eth_paper_trading():
+    """Test ETH paper trading on Paradex."""
+    print("=" * 60)
+    print("TEST 6: ETH Paper Trading (Paradex)")
+    print("=" * 60)
+
+    client = ParadexClient(market="ETH-USD-PERP", paper_mode=True)
+    connected = await client.connect()
+    assert connected, "Failed to connect"
+    print("Connected to Paradex ETH market (paper mode)")
+
+    # Test BBO
+    bbo = await client.get_bbo()
+    print(f"ETH BBO: {bbo.bid_price} / {bbo.ask_price}")
+
+    # Test buy order
+    order = await client.place_order(side=OrderSide.BUY, size=0.1, order_type=OrderType.MARKET)
+    assert order.status.name == "FILLED", "Order should be filled"
+    print(f"ETH Buy order filled at {order.avg_fill_price}")
+
+    # Check position
+    positions = await client.get_positions()
+    assert len(positions) == 1, "Should have 1 position"
+    print(f"ETH Position: {positions[0].side} {positions[0].size}")
+
+    # Close position
+    await client.place_order(side=OrderSide.SELL, size=0.1, order_type=OrderType.MARKET)
+
+    await client.disconnect()
+    print("TEST 6 PASSED\n")
+
+
 async def main():
     """Run all tests."""
     print("\n" + "=" * 60)
-    print("BTC MOMENTUM BOT - INTEGRATION TESTS")
+    print("MULTI-ASSET MOMENTUM BOT - INTEGRATION TESTS")
     print("Phase 1 Strategy + Phase 2 Exchange Integration")
+    print("Supports: BTC, ETH, SOL")
     print("=" * 60 + "\n")
 
     try:
@@ -203,12 +288,17 @@ async def main():
         await test_strategy_signals()
         await test_risk_management()
         await test_lighter_client()
+        await test_multi_asset_configs()
+        await test_eth_paper_trading()
 
         print("=" * 60)
         print("ALL TESTS PASSED!")
         print("=" * 60)
         print("\nThe bot is ready for paper trading.")
-        print("Run: python runbot.py --exchange paradex --ticker BTC --paper")
+        print("Run commands:")
+        print("  python runbot.py --exchange paradex --ticker BTC --paper")
+        print("  python runbot.py --exchange paradex --ticker ETH --paper")
+        print("  python runbot.py --exchange paradex --ticker SOL --paper  (not recommended - high drawdown)")
 
     except AssertionError as e:
         print(f"\nTEST FAILED: {e}")

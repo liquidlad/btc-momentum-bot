@@ -1,0 +1,18 @@
+{
+  "optimized_params": {
+    "min_conditions": 2,
+    "ema_fast": 3,
+    "ema_slow": 10,
+    "roc_threshold": 0.05,
+    "volume_multiplier": 1.0,
+    "stop_loss_pct": 0.1,
+    "take_profit_1_pct": 0.12
+  },
+  "expected_metrics": {
+    "trades_per_day": 32.0,
+    "win_rate": 40.49,
+    "profit_factor": 1.07,
+    "total_return_pct": 107.81,
+    "max_drawdown_pct": 22.71
+  }
+}
