@@ -364,6 +364,51 @@ btc-momentum-bot/
 - **Paper trading verified working on Lighter**
 - **STATUS: READY FOR LIGHTER LIVE TRADING**
 
+### 2026-01-18 (Session 9 - RSI+BB Strategy & Lighter Bug Fixes)
+- **NEW STRATEGY**: RSI + Bollinger Band mean-reversion strategy
+  - Entry: SHORT when price > upper BB(20) AND RSI(7) > threshold
+  - Exit: Lower BB OR trailing stop (0.2% after 0.1% profit) OR stop loss (0.3%)
+  - Per-asset RSI thresholds: BTC > 75, ETH > 60, SOL > 65
+  - **SHORT-ONLY strategy** (does not take long positions)
+
+- **90-Day Backtest Results (SHORT strategy)**:
+  | Asset | PnL | Win Rate | Max DD |
+  |-------|-----|----------|--------|
+  | BTC | $1,013 | 56% | 41% |
+  | ETH | $1,371 | 52% | 44% |
+  | SOL | $1,792 | 52% | 51% |
+  | **TOTAL** | **$4,176** | | |
+
+- **Long Strategy Backtest** (for comparison - NOT implemented):
+  | Asset | PnL | Win Rate | Max DD |
+  |-------|-----|----------|--------|
+  | BTC | $551 | 64% | 68% |
+  | ETH | $713 | 45% | 69% |
+  | SOL | $957 | 58% | 68% |
+  | **TOTAL** | **$2,221** | | |
+  - **Conclusion**: Short strategy significantly outperforms long (~2x profit, lower drawdown)
+
+- **CRITICAL BUG FIXES** in `exchange/lighter_client.py`:
+  1. **Nonce Collision Fix** (code 21104 errors):
+     - Added global `asyncio.Lock()` shared across all clients (BTC, ETH, SOL)
+     - Prevents simultaneous order placement from same account
+     - Added 200ms minimum spacing between orders
+     - Fresh nonce sync from server before each order
+     - Increased MAX_RETRIES from 1 to 3 with exponential backoff
+
+  2. **Position Attribute Fix** (`'AccountPosition' object has no attribute 'size'`):
+     - Lighter SDK uses different attribute names than expected
+     - Now tries multiple attribute names: `size`, `base_amount`, `position_size`, `amount`, `qty`, `quantity`
+     - Same fix applied for `entry_price` and `unrealized_pnl`
+     - Added debug logging to show available attributes when not found
+
+- **Files Modified**:
+  - `exchange/lighter_client.py` - Major bug fixes
+  - `strategy/rsi_bb_strategy.py` - Added status logging
+  - `backtest_rsi_bb_long.py` - New file for long strategy backtesting
+
+- **STATUS: LIVE TESTING IN PROGRESS**
+
 ### Remaining Work for Live Deployment
 1. ~~Integrate perp-dex-toolkit for Paradex/Lighter API~~ **DONE**
 2. ~~Implement real-time price feed~~ **DONE**
@@ -406,17 +451,17 @@ Expected Profit: ~$2.43/day
 ### How to Run the Bot
 
 ```bash
-# RECOMMENDED: Paper trading on Lighter (0% fees)
-python runbot.py --exchange lighter --ticker BTC --paper
+# RSI+BB Strategy (CURRENT - SHORT only, mean reversion)
+python run_rsi_bb.py --live                    # Live trading all assets
+python run_rsi_bb.py --live --assets BTC,ETH   # Specific assets
+python run_rsi_bb.py --size 50                 # Custom margin size
 
-# Paper trading ETH on Lighter
-python runbot.py --exchange lighter --ticker ETH --paper
+# Original Momentum Strategy
+python runbot.py --exchange lighter --ticker BTC --paper  # Paper trading
+python runbot.py --exchange lighter --ticker BTC          # Live trading
 
 # Run integration tests (6 tests)
 python test_integration.py
-
-# Live trading on Lighter (requires credentials)
-python runbot.py --exchange lighter --ticker BTC
 
 # NOT RECOMMENDED: Paradex (has 0.019% API fees)
 # python runbot.py --exchange paradex --ticker BTC --paper

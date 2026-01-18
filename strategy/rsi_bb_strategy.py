@@ -381,13 +381,38 @@ class RSIBBStrategy:
 
         logger.info(f"{asset}: Starting RSI+BB strategy (RSI entry > {self.rsi_entry.get(asset, 70)})")
         log_counter = 0
+        first_bbo = True
 
         while self.running:
             try:
                 bbo = await client.get_bbo()
                 mid_price = (bbo.bid_price + bbo.ask_price) / 2
 
+                if first_bbo:
+                    logger.info(f"{asset}: First BBO received - Bid: {bbo.bid_price:.2f}, Ask: {bbo.ask_price:.2f}")
+                    first_bbo = False
+
                 trade = self.active_trades[asset]
+                if trade:
+                    pass  # Position logging handled below
+                else:
+                    # Log status periodically when not in a trade
+                    log_counter += 1
+                    if log_counter >= 4:  # Log every ~2 minutes (4 * 30s)
+                        prices = list(self.price_history[asset])
+                        price_count = len(prices)
+                        if price_count >= max(self.config.bb_period, self.config.rsi_period + 1):
+                            _, _, upper_bb = self.calculate_bb(prices)
+                            rsi = self.calculate_rsi(prices)
+                            rsi_thresh = self.rsi_entry.get(asset, 70)
+                            logger.info(
+                                f"{asset}: Watching - Price: {mid_price:.2f}, Upper BB: {upper_bb:.2f}, "
+                                f"RSI: {rsi:.1f}/{rsi_thresh} (need price > BB AND RSI > {rsi_thresh})"
+                            )
+                        else:
+                            logger.info(f"{asset}: Building history - {price_count}/{self.config.bb_period} prices collected")
+                        log_counter = 0
+
                 if trade:
                     log_counter += 1
                     if log_counter >= 12:  # Log every ~60s
