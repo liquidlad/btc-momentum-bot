@@ -125,6 +125,119 @@ class LighterClient(ExchangeClient):
         except Exception as e:
             logger.warning(f"Lighter: Could not sync nonce (non-fatal): {e}")
 
+    async def place_order_until_filled(
+        self,
+        side: 'OrderSide',
+        size: float,
+        order_type: 'OrderType' = None,
+        max_attempts: int = 5,
+        verify_timeout: float = 5.0,
+    ) -> 'Order':
+        """
+        Place an order and retry with increasing slippage until it fills.
+
+        This is critical for exit orders that MUST fill to close positions.
+        Uses slippage ramp: 0.2% -> 0.5% -> 1% -> 1.5% -> 2%.
+
+        Args:
+            side: BUY or SELL
+            size: Order size
+            order_type: Order type (defaults to MARKET)
+            max_attempts: Maximum number of attempts
+            verify_timeout: Seconds to wait for fill verification
+
+        Returns:
+            Order object if successful
+
+        Raises:
+            ValueError if order fails after all attempts
+        """
+        if order_type is None:
+            from .base import OrderType
+            order_type = OrderType.MARKET
+
+        last_error = None
+        # Slippage ramp for exits: 0.2% -> 0.5% -> 1% -> 1.5% -> 2%
+        slippage_schedule = [0.2, 0.5, 1.0, 1.5, 2.0]
+
+        for attempt in range(max_attempts):
+            slippage = slippage_schedule[min(attempt, len(slippage_schedule) - 1)]
+            try:
+                # Place order with explicit slippage for exits
+                logger.info(f"Exit attempt {attempt + 1}/{max_attempts} with {slippage}% slippage")
+                order = await self.place_order(
+                    side=side,
+                    size=size,
+                    order_type=order_type,
+                    slippage_pct=slippage,  # Aggressive slippage for exits
+                )
+
+                # Verify the order filled
+                if not self.paper_mode:
+                    filled = await self.verify_order_filled(side, size, timeout_seconds=verify_timeout)
+                    if filled:
+                        logger.info(f"Lighter: Order confirmed filled after {attempt + 1} attempt(s)")
+                        return order
+                    else:
+                        # Order placed but not filled - try again with more slippage
+                        logger.warning(f"Lighter: Order not filled, retrying with more slippage (attempt {attempt + 1}/{max_attempts})")
+                        continue
+                else:
+                    return order
+
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Lighter: Order attempt {attempt + 1}/{max_attempts} failed: {e}")
+                await asyncio.sleep(0.5)
+                continue
+
+        # All attempts failed
+        error_msg = f"Order failed after {max_attempts} attempts. Last error: {last_error}"
+        logger.error(f"Lighter: {error_msg}")
+        raise ValueError(error_msg)
+
+    async def verify_order_filled(self, side: 'OrderSide', expected_size: float, timeout_seconds: float = 10.0) -> bool:
+        """
+        Verify an order was filled by checking position changes.
+
+        For closing positions (BUY to close short, SELL to close long),
+        we verify the position size decreased or was eliminated.
+
+        Returns True if order appears to have filled, False otherwise.
+        """
+        if self.paper_mode:
+            return True  # Paper mode always "fills"
+
+        try:
+            import time
+            start_time = time.time()
+            check_interval = 0.5
+
+            while time.time() - start_time < timeout_seconds:
+                positions = await self.get_positions()
+
+                # If no position exists, the close order worked
+                if not positions:
+                    logger.info(f"Lighter: Order verified - no open position")
+                    return True
+
+                # Check if position size matches expected reduction
+                for pos in positions:
+                    if pos.market == self.market:
+                        # Position still exists - check if it was reduced
+                        logger.info(f"Lighter: Position check - size={pos.size}, side={pos.side}")
+                        # For now, if position exists we continue waiting
+                        break
+
+                await asyncio.sleep(check_interval)
+
+            logger.warning(f"Lighter: Order fill verification timed out after {timeout_seconds}s")
+            return False
+
+        except Exception as e:
+            logger.warning(f"Lighter: Could not verify order fill: {e}")
+            return False  # Assume not filled if we can't verify
+
     async def _fetch_orderbook_mapping(self):
         """Fetch orderbook IDs for markets."""
         try:
@@ -352,9 +465,10 @@ class LighterClient(ExchangeClient):
         price: Optional[float] = None,
         client_id: Optional[str] = None,
         _retry_count: int = 0,
+        slippage_pct: Optional[float] = None,  # Override slippage (for exits)
     ) -> Order:
         """Place an order with automatic retry on nonce errors."""
-        MAX_RETRIES = 3
+        MAX_RETRIES = 1  # Only retry once for entries (nonce errors only)
         client_id = client_id or f"bot_{int(time.time() * 1000)}"
 
         if self.paper_mode:
@@ -424,7 +538,12 @@ class LighterClient(ExchangeClient):
             # Apply slippage tolerance to avg_execution_price
             # For BUY: allow paying up to X% more than current ask
             # For SELL: allow receiving up to X% less than current bid
-            slippage_tolerance = 0.002  # 0.2% slippage tolerance
+            # Use provided slippage_pct (for exits) or default for entries (0.2% -> 0.4% on retry)
+            if slippage_pct is not None:
+                slippage_tolerance = slippage_pct / 100  # Convert percentage to decimal
+            else:
+                # Entries: 0.2% first try, 0.4% on retry
+                slippage_tolerance = 0.002 if _retry_count == 0 else 0.004
             if side == OrderSide.BUY:
                 price_with_slippage = current_price * (1 + slippage_tolerance)
             else:
@@ -449,7 +568,7 @@ class LighterClient(ExchangeClient):
             if order_type == OrderType.MARKET:
                 # Use create_market_order for market orders
                 # Parameters: market_index, client_order_index, base_amount, avg_execution_price, is_ask
-                logger.info(f"Placing market order: market={self._orderbook_id}, size={size_int}, bbo_price={current_price:.2f}, max_price={price_with_slippage:.2f} (0.2% slippage), is_ask={is_ask}")
+                logger.info(f"Placing market order: market={self._orderbook_id}, size={size_int}, bbo_price={current_price:.2f}, max_price={price_with_slippage:.2f} ({slippage_tolerance*100:.1f}% slippage), is_ask={is_ask}")
                 result = await self.signer_client.create_market_order(
                     market_index=self._orderbook_id,
                     client_order_index=client_order_idx,
@@ -460,16 +579,17 @@ class LighterClient(ExchangeClient):
                 # Result is tuple: (tx, response, error)
                 tx, response, error = result
                 if error:
-                    error_str = str(error)
-                    # Check for invalid nonce error (code 21104)
-                    if "21104" in error_str or "invalid nonce" in error_str.lower():
-                        if _retry_count < MAX_RETRIES:
-                            retry_delay = 0.5 * (2 ** _retry_count)  # Exponential backoff: 0.5s, 1s, 2s
-                            logger.warning(f"Invalid nonce error, retrying in {retry_delay}s (attempt {_retry_count + 1}/{MAX_RETRIES})...")
-                            await asyncio.sleep(retry_delay)
-                            # Sync nonce before retry
+                    error_str = str(error).lower()
+                    # For entries (no slippage_pct): retry once with 0.4% slippage
+                    # For exits (slippage_pct set): don't retry here, let place_order_until_filled handle it
+                    if slippage_pct is None and _retry_count < MAX_RETRIES:
+                        retry_delay = 0.5
+                        # Sync nonce if it's a nonce error
+                        if "21104" in error_str or "invalid nonce" in error_str:
                             await self._sync_nonces()
-                            return await self.place_order(side, size, order_type, price, client_id, _retry_count + 1)
+                        logger.warning(f"Order error: {error}, retrying with 0.4% slippage...")
+                        await asyncio.sleep(retry_delay)
+                        return await self.place_order(side, size, order_type, price, client_id, _retry_count + 1, slippage_pct)
                     logger.error(f"Order failed: {error}")
                     raise ValueError(f"Order failed: {error}")
                 logger.info(f"Order response: {response}")
