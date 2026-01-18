@@ -403,15 +403,35 @@ class LighterClient(ExchangeClient):
             # is_ask = True for SELL, False for BUY
             is_ask = side == OrderSide.SELL
 
+            # Apply slippage tolerance to avg_execution_price
+            # For BUY: allow paying up to X% more than current ask
+            # For SELL: allow receiving up to X% less than current bid
+            slippage_tolerance = 0.002  # 0.2% slippage tolerance
+            if side == OrderSide.BUY:
+                price_with_slippage = current_price * (1 + slippage_tolerance)
+            else:
+                price_with_slippage = current_price * (1 - slippage_tolerance)
+
             # Convert to integer format (Lighter uses smallest units)
-            # BTC: size_decimals=5, price_decimals=1
-            size_int = int(size * 100000)  # 5 decimals
-            price_int = int(current_price * 10)  # 1 decimal
+            # Market-specific decimal precision
+            symbol = self.market.split("-")[0] if "-" in self.market else self.market
+            if symbol == "BTC":
+                size_decimals = 5  # 0.00001 BTC precision
+                price_decimals = 1
+            elif symbol == "ETH":
+                size_decimals = 4  # 0.0001 ETH precision
+                price_decimals = 2
+            else:
+                size_decimals = 4  # Default for other markets
+                price_decimals = 2
+
+            size_int = int(size * (10 ** size_decimals))
+            price_int = int(price_with_slippage * (10 ** price_decimals))
 
             if order_type == OrderType.MARKET:
                 # Use create_market_order for market orders
                 # Parameters: market_index, client_order_index, base_amount, avg_execution_price, is_ask
-                logger.info(f"Placing market order: market={self._orderbook_id}, size={size_int}, price={price_int}, is_ask={is_ask}")
+                logger.info(f"Placing market order: market={self._orderbook_id}, size={size_int}, bbo_price={current_price:.2f}, max_price={price_with_slippage:.2f} (0.1% slippage), is_ask={is_ask}")
                 result = await self.signer_client.create_market_order(
                     market_index=self._orderbook_id,
                     client_order_index=client_order_idx,
@@ -430,7 +450,7 @@ class LighterClient(ExchangeClient):
                 if price is None:
                     raise ValueError("Price required for limit orders")
 
-                limit_price_int = int(price * 10)  # 1 decimal
+                limit_price_int = int(price * (10 ** price_decimals))
                 logger.info(f"Placing limit order: market={self._orderbook_id}, size={size_int}, price={limit_price_int}, is_ask={is_ask}")
                 result = await self.signer_client.create_order(
                     market_index=self._orderbook_id,

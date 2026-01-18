@@ -1,0 +1,24 @@
+{
+  "min_conditions": 3,
+  "ema_fast": 3,
+  "ema_slow": 15,
+  "roc_threshold": 0.05,
+  "volume_multiplier": 1.0,
+  "stop_loss_pct": 0.20,
+  "take_profit_1_pct": 0.40,
+  "take_profit_2_pct": 0.60,
+  "max_hold_candles": 15,
+  "expected_metrics": {
+    "total_return_pct": 197.14,
+    "win_rate": 31.5,
+    "trades_per_day": 20.0,
+    "max_drawdown_pct": 39.94,
+    "trading_days": 90
+  },
+  "fee_assumptions": {
+    "maker_fee": 0.0,
+    "taker_fee": 0.0,
+    "note": "Lighter 0% fees"
+  },
+  "notes": "Optimized for maximum ROI with minimum 5 trades/day. Win rate is ~31.5% but favorable risk/reward (1:2 SL:TP ratio) makes it highly profitable."
+}

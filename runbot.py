@@ -341,7 +341,14 @@ async def main_async(args) -> None:
 
         # Use Lighter-optimized params for Lighter exchange (0% fees = wider targets)
         if args.exchange == "lighter":
-            config_path = "config/optimized_params_lighter.json"
+            if ticker_lower == "btc":
+                config_path = "config/optimized_params_btc_highROI.json"
+            elif ticker_lower == "eth":
+                config_path = "config/optimized_params_eth_highROI.json"
+            elif ticker_lower == "sol":
+                config_path = "config/optimized_params_sol_highROI.json"
+            else:
+                config_path = "config/optimized_params_lighter.json"
         elif ticker_lower == "btc":
             config_path = "config/optimized_params.json"
         elif ticker_lower == "eth":
