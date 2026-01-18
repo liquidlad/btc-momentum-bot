@@ -1,13 +1,10 @@
 """
-Bollinger Band Short Strategy (Mean Reversion)
+Bollinger Band Band-to-Band Strategy (Mean Reversion)
 
 Entry: SHORT when price closes above upper Bollinger Band
-Exit: Pure SL/TP (no time-based exits)
+Exit: When price closes below lower Bollinger Band (or SL hit)
 
-Verified profitable on BTC, ETH, SOL with:
-- SL: 0.3%, TP: 0.4%
-- Win rate ~46% vs 42.9% breakeven
-- Positive EV: +0.02-0.03% per trade
+Higher risk/reward than fixed TP - holds until full mean reversion.
 """
 
 import asyncio
@@ -28,42 +25,49 @@ os.makedirs(TRADE_HISTORY_DIR, exist_ok=True)
 
 
 @dataclass
-class BBShortTrade:
+class BB2BTrade:
     """Active short trade."""
     asset: str
     entry_time: datetime
     entry_price: float
     size: float
     stop_loss_price: float
-    take_profit_price: float
+    # No fixed TP - exit on lower band
 
 
 @dataclass
-class BBShortConfig:
-    """Configuration for BB Short strategy."""
+class BB2BConfig:
+    """Configuration for BB Band-to-Band strategy."""
     bb_period: int = 20
     bb_std: float = 2.0
-    stop_loss_pct: float = 0.30
-    take_profit_pct: float = 0.40
-    margin_per_trade: float = 100.0  # $100 margin per asset
-    leverage: float = 20.0  # 20x leverage = $2000 notional per trade
+    stop_loss_pct: float = 0.30  # Optimal from backtest: BTC 0.2%, ETH 0.4%, SOL 0.3%
+    margin_per_trade: float = 25.0  # $25 margin per asset (25% of main bot)
+    leverage: float = 20.0  # 20x leverage = $500 notional per trade
 
 
-class BBShortStrategy:
+class BB2BStrategy:
     """
-    Bollinger Band Short Mean Reversion Strategy.
+    Bollinger Band Band-to-Band Mean Reversion Strategy.
 
     Shorts when price is overbought (above upper BB).
-    Pure SL/TP exits - no time-based exits.
+    Exits when price reaches lower BB (full mean reversion) or SL.
     """
 
     def __init__(
         self,
-        exchange_clients: Dict[str, any],  # {"BTC": client, "ETH": client, "SOL": client}
-        config: BBShortConfig = None,
+        exchange_clients: Dict[str, any],
+        config: BB2BConfig = None,
+        asset_sl_overrides: Dict[str, float] = None,  # Per-asset SL optimization
     ):
         self.clients = exchange_clients
-        self.config = config or BBShortConfig()
+        self.config = config or BB2BConfig()
+
+        # Per-asset SL overrides based on backtest optimization
+        self.asset_sl = asset_sl_overrides or {
+            "BTC": 0.20,  # Optimal for BTC
+            "ETH": 0.40,  # Optimal for ETH
+            "SOL": 0.30,  # Optimal for SOL
+        }
 
         # Price history for BB calculation (need bb_period + buffer)
         self.price_history: Dict[str, deque] = {
@@ -72,20 +76,20 @@ class BBShortStrategy:
         }
 
         # Active trades per asset
-        self.active_trades: Dict[str, Optional[BBShortTrade]] = {
+        self.active_trades: Dict[str, Optional[BB2BTrade]] = {
             asset: None for asset in exchange_clients.keys()
         }
 
         # Stats
         self.stats = {
-            asset: {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0}
+            asset: {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "band_exits": 0, "sl_exits": 0}
             for asset in exchange_clients.keys()
         }
 
         self.running = False
 
         # Trade history CSV file
-        self.trade_history_file = os.path.join(TRADE_HISTORY_DIR, "bb_short_trades.csv")
+        self.trade_history_file = os.path.join(TRADE_HISTORY_DIR, "bandtoband_trades.csv")
         self._init_trade_history()
 
     def _init_trade_history(self):
@@ -96,7 +100,7 @@ class BBShortStrategy:
                 writer.writerow([
                     'timestamp', 'asset', 'entry_time', 'exit_time', 'entry_price',
                     'exit_price', 'size', 'pnl_pct', 'pnl_usd', 'exit_reason',
-                    'sl_price', 'tp_price', 'hold_seconds'
+                    'sl_price', 'hold_seconds'
                 ])
 
     def _log_trade(self, asset: str, trade, exit_price: float, pnl_pct: float, pnl_usd: float, exit_reason: str):
@@ -117,7 +121,6 @@ class BBShortStrategy:
                     round(pnl_usd, 2),
                     exit_reason,
                     trade.stop_loss_price,
-                    trade.take_profit_price,
                     round(hold_seconds, 1)
                 ])
         except Exception as e:
@@ -160,13 +163,16 @@ class BBShortStrategy:
         if trade is None:
             return None
 
-        # For short: profit when price goes down, loss when price goes up
-        pnl_pct = (trade.entry_price - current_price) / trade.entry_price * 100
-
+        # Check SL first (price went up for short)
         if current_price >= trade.stop_loss_price:
             return "stop_loss"
-        elif current_price <= trade.take_profit_price:
-            return "take_profit"
+
+        # Check if price is below lower BB (mean reversion complete)
+        prices = list(self.price_history[asset])
+        if len(prices) >= self.config.bb_period:
+            lower_bb, _, _ = self.calculate_bb(prices)
+            if lower_bb and current_price < lower_bb:
+                return "lower_band"
 
         return None
 
@@ -178,9 +184,9 @@ class BBShortStrategy:
         notional = self.config.margin_per_trade * self.config.leverage
         size = notional / current_price
 
-        # Calculate SL/TP prices (for short: SL above entry, TP below entry)
-        sl_price = current_price * (1 + self.config.stop_loss_pct / 100)
-        tp_price = current_price * (1 - self.config.take_profit_pct / 100)
+        # Get asset-specific SL
+        sl_pct = self.asset_sl.get(asset, self.config.stop_loss_pct)
+        sl_price = current_price * (1 + sl_pct / 100)
 
         try:
             from exchange.base import OrderSide, OrderType
@@ -193,16 +199,15 @@ class BBShortStrategy:
 
             fill_price = order.avg_fill_price or current_price
 
-            self.active_trades[asset] = BBShortTrade(
+            self.active_trades[asset] = BB2BTrade(
                 asset=asset,
                 entry_time=datetime.now(),
                 entry_price=fill_price,
                 size=size,
                 stop_loss_price=sl_price,
-                take_profit_price=tp_price,
             )
 
-            logger.info(f"{asset}: ENTERED SHORT @ {fill_price:.2f}, Size: ${notional:.0f} ({size:.4f}), SL: {sl_price:.2f}, TP: {tp_price:.2f}")
+            logger.info(f"{asset}: ENTERED SHORT @ {fill_price:.2f}, Size: ${notional:.0f} ({size:.4f}), SL: {sl_price:.2f} ({sl_pct}%), Exit: Lower BB")
 
         except Exception as e:
             logger.error(f"{asset}: Failed to enter short: {e}")
@@ -239,13 +244,18 @@ class BBShortStrategy:
             else:
                 self.stats[asset]["losses"] += 1
 
+            if reason == "lower_band":
+                self.stats[asset]["band_exits"] += 1
+            elif reason == "stop_loss":
+                self.stats[asset]["sl_exits"] += 1
+
             # Log trade to CSV
             self._log_trade(asset, trade, fill_price, pnl_pct, pnl_usd, reason)
 
             win_rate = self.stats[asset]["wins"] / self.stats[asset]["trades"] * 100 if self.stats[asset]["trades"] > 0 else 0
 
             logger.info(f"{asset}: EXITED SHORT @ {fill_price:.2f} ({reason}), PnL: {pnl_pct:+.2f}% (${pnl_usd:+.2f})")
-            logger.info(f"{asset}: Stats - Trades: {self.stats[asset]['trades']}, WR: {win_rate:.1f}%, Total PnL: ${self.stats[asset]['pnl']:.2f}")
+            logger.info(f"{asset}: Stats - Trades: {self.stats[asset]['trades']}, WR: {win_rate:.1f}%, Band: {self.stats[asset]['band_exits']}, SL: {self.stats[asset]['sl_exits']}, Total PnL: ${self.stats[asset]['pnl']:.2f}")
 
             self.active_trades[asset] = None
 
@@ -271,31 +281,33 @@ class BBShortStrategy:
         """Run strategy loop for a single asset."""
         client = self.clients[asset]
 
-        logger.info(f"{asset}: Starting BB Short strategy")
-        log_counter = 0  # Only log every 12th check (once per minute) when in trade
+        logger.info(f"{asset}: Starting BB Band-to-Band strategy")
+        log_counter = 0
 
         while self.running:
             try:
                 bbo = await client.get_bbo()
-                # For shorts: use bid price for exit checks (that's what you get when buying to close)
-                # Use mid price for entry signals
                 mid_price = (bbo.bid_price + bbo.ask_price) / 2
 
-                # Log price if we have an active trade (every 60s to avoid spam)
+                # Log price if we have an active trade
                 trade = self.active_trades[asset]
                 if trade:
                     log_counter += 1
-                    if log_counter >= 12:  # Log every ~60 seconds (12 * 5s)
+                    if log_counter >= 12:  # Log every ~60 seconds
+                        prices = list(self.price_history[asset])
+                        lower_bb, _, _ = self.calculate_bb(prices) if len(prices) >= self.config.bb_period else (None, None, None)
                         pnl_pct = (trade.entry_price - bbo.bid_price) / trade.entry_price * 100
                         pnl_usd = pnl_pct / 100 * self.config.margin_per_trade * self.config.leverage
-                        logger.info(f"{asset}: Bid: {bbo.bid_price:.2f}, TP: {trade.take_profit_price:.2f}, SL: {trade.stop_loss_price:.2f}, PnL: ${pnl_usd:+.2f}")
+                        lower_str = f"{lower_bb:.2f}" if lower_bb else "N/A"
+                        logger.info(f"{asset}: Bid: {bbo.bid_price:.2f}, LowerBB: {lower_str}, SL: {trade.stop_loss_price:.2f}, PnL: ${pnl_usd:+.2f}")
                         log_counter = 0
                 else:
                     log_counter = 0
 
+                # Use bid price for exit checks when in trade
                 await self.update(asset, bbo.bid_price if self.active_trades[asset] else mid_price)
 
-                # When in a trade: check every 5 seconds for faster SL/TP response
+                # When in a trade: check every 5 seconds
                 # When not in trade: check every 30 seconds for entry signals
                 if self.active_trades[asset]:
                     await asyncio.sleep(5)
@@ -316,9 +328,11 @@ class BBShortStrategy:
                 await client.connect()
 
         logger.info("="*60)
-        logger.info("BB SHORT STRATEGY - Starting")
+        logger.info("BB BAND-TO-BAND STRATEGY - Starting")
         logger.info(f"Assets: {list(self.clients.keys())}")
-        logger.info(f"Config: BB({self.config.bb_period}), SL: {self.config.stop_loss_pct}%, TP: {self.config.take_profit_pct}%")
+        logger.info(f"Config: BB({self.config.bb_period}), Exit: Lower BB")
+        logger.info(f"Stop Loss by asset: {self.asset_sl}")
+        logger.info(f"Position size: ${self.config.margin_per_trade} x {self.config.leverage}x = ${self.config.margin_per_trade * self.config.leverage}")
         logger.info("="*60)
 
         # Run all assets concurrently
@@ -349,7 +363,7 @@ class BBShortStrategy:
         for asset, stats in self.stats.items():
             if stats["trades"] > 0:
                 wr = stats["wins"] / stats["trades"] * 100
-                logger.info(f"{asset}: {stats['trades']} trades, WR: {wr:.1f}%, PnL: ${stats['pnl']:.2f}")
+                logger.info(f"{asset}: {stats['trades']} trades, WR: {wr:.1f}%, Band: {stats['band_exits']}, SL: {stats['sl_exits']}, PnL: ${stats['pnl']:.2f}")
                 total_trades += stats["trades"]
                 total_wins += stats["wins"]
                 total_pnl += stats["pnl"]
