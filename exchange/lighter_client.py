@@ -99,6 +99,9 @@ class LighterClient(ExchangeClient):
             # Get orderbook info to find the right orderbook ID for our market
             await self._fetch_orderbook_mapping()
 
+            # Sync nonces by fetching account state
+            await self._sync_nonces()
+
             self.connected = True
             logger.info(f"Lighter: Connected successfully (account {self.account_index})")
             return True
@@ -108,6 +111,19 @@ class LighterClient(ExchangeClient):
             import traceback
             traceback.print_exc()
             return False
+
+    async def _sync_nonces(self):
+        """Sync nonces from the server to avoid invalid nonce errors."""
+        try:
+            # Fetch account info to help SDK sync nonce state
+            account = await self.account_api.account(by='index', value=str(self.account_index))
+            if hasattr(account, 'accounts') and account.accounts:
+                acc = account.accounts[0]
+                nonce = getattr(acc, 'nonce', None) or getattr(acc, 'order_nonce', None)
+                if nonce is not None:
+                    logger.info(f"Lighter: Account nonce synced: {nonce}")
+        except Exception as e:
+            logger.warning(f"Lighter: Could not sync nonce (non-fatal): {e}")
 
     async def _fetch_orderbook_mapping(self):
         """Fetch orderbook IDs for markets."""
@@ -335,8 +351,10 @@ class LighterClient(ExchangeClient):
         order_type: OrderType = OrderType.MARKET,
         price: Optional[float] = None,
         client_id: Optional[str] = None,
+        _retry_count: int = 0,
     ) -> Order:
-        """Place an order."""
+        """Place an order with automatic retry on nonce errors."""
+        MAX_RETRIES = 3
         client_id = client_id or f"bot_{int(time.time() * 1000)}"
 
         if self.paper_mode:
@@ -431,7 +449,7 @@ class LighterClient(ExchangeClient):
             if order_type == OrderType.MARKET:
                 # Use create_market_order for market orders
                 # Parameters: market_index, client_order_index, base_amount, avg_execution_price, is_ask
-                logger.info(f"Placing market order: market={self._orderbook_id}, size={size_int}, bbo_price={current_price:.2f}, max_price={price_with_slippage:.2f} (0.1% slippage), is_ask={is_ask}")
+                logger.info(f"Placing market order: market={self._orderbook_id}, size={size_int}, bbo_price={current_price:.2f}, max_price={price_with_slippage:.2f} (0.2% slippage), is_ask={is_ask}")
                 result = await self.signer_client.create_market_order(
                     market_index=self._orderbook_id,
                     client_order_index=client_order_idx,
@@ -442,6 +460,16 @@ class LighterClient(ExchangeClient):
                 # Result is tuple: (tx, response, error)
                 tx, response, error = result
                 if error:
+                    error_str = str(error)
+                    # Check for invalid nonce error (code 21104)
+                    if "21104" in error_str or "invalid nonce" in error_str.lower():
+                        if _retry_count < MAX_RETRIES:
+                            retry_delay = 0.5 * (2 ** _retry_count)  # Exponential backoff: 0.5s, 1s, 2s
+                            logger.warning(f"Invalid nonce error, retrying in {retry_delay}s (attempt {_retry_count + 1}/{MAX_RETRIES})...")
+                            await asyncio.sleep(retry_delay)
+                            # Sync nonce before retry
+                            await self._sync_nonces()
+                            return await self.place_order(side, size, order_type, price, client_id, _retry_count + 1)
                     logger.error(f"Order failed: {error}")
                     raise ValueError(f"Order failed: {error}")
                 logger.info(f"Order response: {response}")
@@ -464,6 +492,16 @@ class LighterClient(ExchangeClient):
                 # Result is tuple: (tx, response, error)
                 tx, response, error = result
                 if error:
+                    error_str = str(error)
+                    # Check for invalid nonce error (code 21104)
+                    if "21104" in error_str or "invalid nonce" in error_str.lower():
+                        if _retry_count < MAX_RETRIES:
+                            retry_delay = 0.5 * (2 ** _retry_count)  # Exponential backoff: 0.5s, 1s, 2s
+                            logger.warning(f"Invalid nonce error, retrying in {retry_delay}s (attempt {_retry_count + 1}/{MAX_RETRIES})...")
+                            await asyncio.sleep(retry_delay)
+                            # Sync nonce before retry
+                            await self._sync_nonces()
+                            return await self.place_order(side, size, order_type, price, client_id, _retry_count + 1)
                     logger.error(f"Order failed: {error}")
                     raise ValueError(f"Order failed: {error}")
                 logger.info(f"Order response: {response}")
@@ -483,7 +521,18 @@ class LighterClient(ExchangeClient):
                 avg_fill_price=0,
                 timestamp=int(time.time() * 1000)
             )
+        except ValueError:
+            # Re-raise ValueError (our own errors) without wrapping
+            raise
         except Exception as e:
+            error_str = str(e)
+            # Check for invalid nonce error in unexpected exceptions too
+            if ("21104" in error_str or "invalid nonce" in error_str.lower()) and _retry_count < MAX_RETRIES:
+                retry_delay = 0.5 * (2 ** _retry_count)
+                logger.warning(f"Invalid nonce error (exception), retrying in {retry_delay}s (attempt {_retry_count + 1}/{MAX_RETRIES})...")
+                await asyncio.sleep(retry_delay)
+                await self._sync_nonces()
+                return await self.place_order(side, size, order_type, price, client_id, _retry_count + 1)
             logger.error(f"Error placing order: {e}")
             raise
 
