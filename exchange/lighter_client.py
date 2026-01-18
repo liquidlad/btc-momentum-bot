@@ -475,14 +475,59 @@ class LighterClient(ExchangeClient):
                 if hasattr(acc, 'positions'):
                     for pos in (acc.positions or []):
                         pos_market_id = getattr(pos, 'market_id', None) or getattr(pos, 'order_book_id', None)
-                        if pos_market_id == self._orderbook_id and float(pos.size or 0) != 0:
-                            size = float(pos.size)
+
+                        # Try multiple possible attribute names for position size
+                        # Lighter SDK may use different names than 'size'
+                        size = None
+                        for attr in ['size', 'base_amount', 'position_size', 'amount', 'qty', 'quantity']:
+                            size = getattr(pos, attr, None)
+                            if size is not None:
+                                break
+
+                        # If still None, log available attributes for debugging
+                        if size is None:
+                            attrs = [a for a in dir(pos) if not a.startswith('_')]
+                            logger.warning(f"Lighter: Could not find size attribute on position. Available: {attrs}")
+                            # Try to get any numeric value that looks like a size
+                            for attr in attrs:
+                                val = getattr(pos, attr, None)
+                                if isinstance(val, (int, float, str)):
+                                    try:
+                                        num_val = float(val)
+                                        if num_val != 0 and abs(num_val) < 1000000:  # Reasonable size
+                                            logger.info(f"Lighter: Using {attr}={num_val} as position size")
+                                            size = num_val
+                                            break
+                                    except (ValueError, TypeError):
+                                        pass
+
+                        if size is None:
+                            continue
+
+                        size = float(size)
+                        if pos_market_id == self._orderbook_id and size != 0:
+                            # Get entry price with fallback attribute names
+                            entry_price = None
+                            for attr in ['entry_price', 'avg_entry_price', 'average_price', 'price']:
+                                entry_price = getattr(pos, attr, None)
+                                if entry_price is not None:
+                                    break
+                            entry_price = float(entry_price or 0)
+
+                            # Get unrealized PnL with fallback attribute names
+                            unrealized_pnl = None
+                            for attr in ['unrealized_pnl', 'unrealizedPnl', 'pnl', 'unrealized_profit']:
+                                unrealized_pnl = getattr(pos, attr, None)
+                                if unrealized_pnl is not None:
+                                    break
+                            unrealized_pnl = float(unrealized_pnl or 0)
+
                             positions.append(Position(
                                 market=self.market,
                                 side="LONG" if size > 0 else "SHORT",
                                 size=abs(size),
-                                entry_price=float(pos.entry_price or 0),
-                                unrealized_pnl=float(pos.unrealized_pnl or 0),
+                                entry_price=entry_price,
+                                unrealized_pnl=unrealized_pnl,
                             ))
 
             return positions
