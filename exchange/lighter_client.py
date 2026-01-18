@@ -20,6 +20,15 @@ from .base import (
 
 logger = logging.getLogger(__name__)
 
+# Global nonce lock shared across ALL LighterClient instances
+# This prevents nonce collisions when multiple clients (BTC, ETH, SOL)
+# share the same Lighter account and try to place orders simultaneously
+_global_order_lock = asyncio.Lock()
+
+# Track the last order time to add minimum spacing between orders
+_last_order_time = 0
+_MIN_ORDER_SPACING_MS = 200  # Minimum 200ms between orders
+
 
 class LighterClient(ExchangeClient):
     """
@@ -112,18 +121,43 @@ class LighterClient(ExchangeClient):
             traceback.print_exc()
             return False
 
-    async def _sync_nonces(self):
-        """Sync nonces from the server to avoid invalid nonce errors."""
+    async def _sync_nonces(self, force_refresh: bool = False):
+        """
+        Sync nonces from the server to avoid invalid nonce errors.
+
+        Args:
+            force_refresh: If True, always fetch fresh nonce from server
+        """
         try:
-            # Fetch account info to help SDK sync nonce state
+            # Fetch account info to get current nonce state
             account = await self.account_api.account(by='index', value=str(self.account_index))
             if hasattr(account, 'accounts') and account.accounts:
                 acc = account.accounts[0]
-                nonce = getattr(acc, 'nonce', None) or getattr(acc, 'order_nonce', None)
+
+                # Try multiple possible attribute names for nonce
+                nonce = None
+                for attr in ['nonce', 'order_nonce', 'tx_nonce', 'sequence']:
+                    nonce = getattr(acc, attr, None)
+                    if nonce is not None:
+                        break
+
                 if nonce is not None:
-                    logger.info(f"Lighter: Account nonce synced: {nonce}")
+                    logger.info(f"Lighter: Account nonce from server: {nonce}")
+                    # If the signer_client has a way to set nonce, use it
+                    if hasattr(self.signer_client, 'set_nonce'):
+                        self.signer_client.set_nonce(int(nonce))
+                        logger.info(f"Lighter: Set signer nonce to {nonce}")
+                    elif hasattr(self.signer_client, '_nonce'):
+                        self.signer_client._nonce = int(nonce)
+                        logger.info(f"Lighter: Set signer _nonce to {nonce}")
+                else:
+                    # Log available attributes for debugging
+                    attrs = [a for a in dir(acc) if not a.startswith('_')]
+                    logger.debug(f"Lighter: Account attributes: {attrs}")
         except Exception as e:
-            logger.warning(f"Lighter: Could not sync nonce (non-fatal): {e}")
+            logger.warning(f"Lighter: Could not sync nonce: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def place_order_until_filled(
         self,
@@ -238,6 +272,23 @@ class LighterClient(ExchangeClient):
             logger.warning(f"Lighter: Could not verify order fill: {e}")
             return False  # Assume not filled if we can't verify
 
+    async def _fetch_order_book_orders(self):
+        """Fetch order book orders, handling both sync and async SDK methods."""
+        import inspect
+        method = self.order_api.order_book_orders
+
+        # Check if the method is async
+        if inspect.iscoroutinefunction(method):
+            # Truly async method
+            return await method(market_id=self._orderbook_id, limit=1)
+        else:
+            # Sync method - run in thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None,
+                lambda: method(market_id=self._orderbook_id, limit=1)
+            )
+
     async def _fetch_orderbook_mapping(self):
         """Fetch orderbook IDs for markets."""
         try:
@@ -292,8 +343,18 @@ class LighterClient(ExchangeClient):
             if self._orderbook_id is None:
                 raise ValueError(f"No orderbook ID for market {self.market}")
 
-            # Get top of book from order_book_orders
-            orders = await self.order_api.order_book_orders(market_id=self._orderbook_id, limit=1)
+            # Get top of book from order_book_orders with timeout
+            logger.debug(f"Fetching BBO for market_id={self._orderbook_id}...")
+            try:
+                # Run the API call with a timeout
+                # The SDK may use async or sync - handle both cases
+                orders = await asyncio.wait_for(
+                    self._fetch_order_book_orders(),
+                    timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"BBO fetch timed out for market {self.market}")
+                raise ValueError(f"BBO fetch timed out for market {self.market}")
 
             bid_price = 0
             bid_size = 0
@@ -468,7 +529,9 @@ class LighterClient(ExchangeClient):
         slippage_pct: Optional[float] = None,  # Override slippage (for exits)
     ) -> Order:
         """Place an order with automatic retry on nonce errors."""
-        MAX_RETRIES = 1  # Only retry once for entries (nonce errors only)
+        global _last_order_time
+
+        MAX_RETRIES = 3  # Increased retries for nonce errors
         client_id = client_id or f"bot_{int(time.time() * 1000)}"
 
         if self.paper_mode:
@@ -519,142 +582,167 @@ class LighterClient(ExchangeClient):
             logger.info(f"PAPER ORDER: {side.value} {size} @ {fill_price:.2f}")
             return order
 
-        try:
-            if self._orderbook_id is None:
-                raise ValueError(f"No orderbook ID for market {self.market}")
+        # Use global lock to prevent nonce collisions across all clients
+        async with _global_order_lock:
+            try:
+                # Enforce minimum spacing between orders
+                current_time_ms = int(time.time() * 1000)
+                time_since_last = current_time_ms - _last_order_time
+                if time_since_last < _MIN_ORDER_SPACING_MS:
+                    wait_time = (_MIN_ORDER_SPACING_MS - time_since_last) / 1000.0
+                    logger.debug(f"Waiting {wait_time:.2f}s for order spacing")
+                    await asyncio.sleep(wait_time)
 
-            is_bid = side == OrderSide.BUY
+                # Sync nonce before placing order (fresh fetch)
+                if _retry_count == 0:
+                    await self._sync_nonces(force_refresh=True)
 
-            # Get current price for market orders
-            bbo = await self.get_bbo()
-            current_price = bbo.ask_price if side == OrderSide.BUY else bbo.bid_price
+                if self._orderbook_id is None:
+                    raise ValueError(f"No orderbook ID for market {self.market}")
 
-            # Generate unique client order index
-            client_order_idx = int(time.time() * 1000) % (2**32)
+                is_bid = side == OrderSide.BUY
 
-            # is_ask = True for SELL, False for BUY
-            is_ask = side == OrderSide.SELL
+                # Get current price for market orders
+                bbo = await self.get_bbo()
+                current_price = bbo.ask_price if side == OrderSide.BUY else bbo.bid_price
 
-            # Apply slippage tolerance to avg_execution_price
-            # For BUY: allow paying up to X% more than current ask
-            # For SELL: allow receiving up to X% less than current bid
-            # Use provided slippage_pct (for exits) or default for entries (0.2% -> 0.4% on retry)
-            if slippage_pct is not None:
-                slippage_tolerance = slippage_pct / 100  # Convert percentage to decimal
-            else:
-                # Entries: 0.2% first try, 0.4% on retry
-                slippage_tolerance = 0.002 if _retry_count == 0 else 0.004
-            if side == OrderSide.BUY:
-                price_with_slippage = current_price * (1 + slippage_tolerance)
-            else:
-                price_with_slippage = current_price * (1 - slippage_tolerance)
+                # Generate unique client order index using timestamp + random component
+                client_order_idx = (int(time.time() * 1000) + hash(self.market)) % (2**32)
 
-            # Convert to integer format (Lighter uses smallest units)
-            # Market-specific decimal precision
-            symbol = self.market.split("-")[0] if "-" in self.market else self.market
-            if symbol == "BTC":
-                size_decimals = 5  # 0.00001 BTC precision
-                price_decimals = 1
-            elif symbol == "ETH":
-                size_decimals = 4  # 0.0001 ETH precision
-                price_decimals = 2
-            else:
-                size_decimals = 4  # Default for other markets
-                price_decimals = 2
+                # is_ask = True for SELL, False for BUY
+                is_ask = side == OrderSide.SELL
 
-            size_int = int(size * (10 ** size_decimals))
-            price_int = int(price_with_slippage * (10 ** price_decimals))
+                # Apply slippage tolerance to avg_execution_price
+                # For BUY: allow paying up to X% more than current ask
+                # For SELL: allow receiving up to X% less than current bid
+                # Use provided slippage_pct (for exits) or default for entries (0.2% -> 0.4% on retry)
+                if slippage_pct is not None:
+                    slippage_tolerance = slippage_pct / 100  # Convert percentage to decimal
+                else:
+                    # Entries: 0.2% first try, 0.4% on retry
+                    slippage_tolerance = 0.002 if _retry_count == 0 else 0.004
+                if side == OrderSide.BUY:
+                    price_with_slippage = current_price * (1 + slippage_tolerance)
+                else:
+                    price_with_slippage = current_price * (1 - slippage_tolerance)
 
-            if order_type == OrderType.MARKET:
-                # Use create_market_order for market orders
-                # Parameters: market_index, client_order_index, base_amount, avg_execution_price, is_ask
-                logger.info(f"Placing market order: market={self._orderbook_id}, size={size_int}, bbo_price={current_price:.2f}, max_price={price_with_slippage:.2f} ({slippage_tolerance*100:.1f}% slippage), is_ask={is_ask}")
-                result = await self.signer_client.create_market_order(
-                    market_index=self._orderbook_id,
-                    client_order_index=client_order_idx,
-                    base_amount=size_int,
-                    avg_execution_price=price_int,
-                    is_ask=is_ask
-                )
-                # Result is tuple: (tx, response, error)
-                tx, response, error = result
-                if error:
-                    error_str = str(error).lower()
-                    # For entries (no slippage_pct): retry once with 0.4% slippage
-                    # For exits (slippage_pct set): don't retry here, let place_order_until_filled handle it
-                    if slippage_pct is None and _retry_count < MAX_RETRIES:
-                        retry_delay = 0.5
-                        # Sync nonce if it's a nonce error
+                # Convert to integer format (Lighter uses smallest units)
+                # Market-specific decimal precision
+                symbol = self.market.split("-")[0] if "-" in self.market else self.market
+                if symbol == "BTC":
+                    size_decimals = 5  # 0.00001 BTC precision
+                    price_decimals = 1
+                elif symbol == "ETH":
+                    size_decimals = 4  # 0.0001 ETH precision
+                    price_decimals = 2
+                else:
+                    size_decimals = 4  # Default for other markets
+                    price_decimals = 2
+
+                size_int = int(size * (10 ** size_decimals))
+                price_int = int(price_with_slippage * (10 ** price_decimals))
+
+                if order_type == OrderType.MARKET:
+                    # Use create_market_order for market orders
+                    # Parameters: market_index, client_order_index, base_amount, avg_execution_price, is_ask
+                    logger.info(f"Placing market order: market={self._orderbook_id}, size={size_int}, bbo_price={current_price:.2f}, max_price={price_with_slippage:.2f} ({slippage_tolerance*100:.1f}% slippage), is_ask={is_ask}")
+                    result = await self.signer_client.create_market_order(
+                        market_index=self._orderbook_id,
+                        client_order_index=client_order_idx,
+                        base_amount=size_int,
+                        avg_execution_price=price_int,
+                        is_ask=is_ask
+                    )
+                    # Result is tuple: (tx, response, error)
+                    tx, response, error = result
+
+                    # Update last order time for spacing
+                    _last_order_time = int(time.time() * 1000)
+
+                    if error:
+                        error_str = str(error).lower()
+                        # For nonce errors, sync and retry
                         if "21104" in error_str or "invalid nonce" in error_str:
-                            await self._sync_nonces()
-                        logger.warning(f"Order error: {error}, retrying with 0.4% slippage...")
-                        await asyncio.sleep(retry_delay)
-                        return await self.place_order(side, size, order_type, price, client_id, _retry_count + 1, slippage_pct)
-                    logger.error(f"Order failed: {error}")
-                    raise ValueError(f"Order failed: {error}")
-                logger.info(f"Order response: {response}")
-            else:
-                # Use create_order for limit orders
-                if price is None:
-                    raise ValueError("Price required for limit orders")
-
-                limit_price_int = int(price * (10 ** price_decimals))
-                logger.info(f"Placing limit order: market={self._orderbook_id}, size={size_int}, price={limit_price_int}, is_ask={is_ask}")
-                result = await self.signer_client.create_order(
-                    market_index=self._orderbook_id,
-                    client_order_index=client_order_idx,
-                    base_amount=size_int,
-                    price=limit_price_int,
-                    is_ask=is_ask,
-                    order_type=self.signer_client.ORDER_TYPE_LIMIT,
-                    time_in_force=self.signer_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
-                )
-                # Result is tuple: (tx, response, error)
-                tx, response, error = result
-                if error:
-                    error_str = str(error)
-                    # Check for invalid nonce error (code 21104)
-                    if "21104" in error_str or "invalid nonce" in error_str.lower():
-                        if _retry_count < MAX_RETRIES:
-                            retry_delay = 0.5 * (2 ** _retry_count)  # Exponential backoff: 0.5s, 1s, 2s
-                            logger.warning(f"Invalid nonce error, retrying in {retry_delay}s (attempt {_retry_count + 1}/{MAX_RETRIES})...")
+                            if _retry_count < MAX_RETRIES:
+                                retry_delay = 0.5 * (2 ** _retry_count)
+                                logger.warning(f"Nonce error on {self.market}, syncing and retrying in {retry_delay}s (attempt {_retry_count + 1}/{MAX_RETRIES})...")
+                                await self._sync_nonces(force_refresh=True)
+                                await asyncio.sleep(retry_delay)
+                                return await self.place_order(side, size, order_type, price, client_id, _retry_count + 1, slippage_pct)
+                        # For other errors on entries, retry with more slippage
+                        elif slippage_pct is None and _retry_count < MAX_RETRIES:
+                            retry_delay = 0.5
+                            logger.warning(f"Order error: {error}, retrying with more slippage...")
                             await asyncio.sleep(retry_delay)
-                            # Sync nonce before retry
-                            await self._sync_nonces()
-                            return await self.place_order(side, size, order_type, price, client_id, _retry_count + 1)
-                    logger.error(f"Order failed: {error}")
-                    raise ValueError(f"Order failed: {error}")
-                logger.info(f"Order response: {response}")
+                            return await self.place_order(side, size, order_type, price, client_id, _retry_count + 1, slippage_pct)
+                        logger.error(f"Order failed: {error}")
+                        raise ValueError(f"Order failed: {error}")
+                    logger.info(f"Order response: {response}")
+                else:
+                    # Use create_order for limit orders
+                    if price is None:
+                        raise ValueError("Price required for limit orders")
 
-            logger.info(f"Lighter order placed: {side.value} {size} @ {price or 'MARKET'}")
+                    limit_price_int = int(price * (10 ** price_decimals))
+                    logger.info(f"Placing limit order: market={self._orderbook_id}, size={size_int}, price={limit_price_int}, is_ask={is_ask}")
+                    result = await self.signer_client.create_order(
+                        market_index=self._orderbook_id,
+                        client_order_index=client_order_idx,
+                        base_amount=size_int,
+                        price=limit_price_int,
+                        is_ask=is_ask,
+                        order_type=self.signer_client.ORDER_TYPE_LIMIT,
+                        time_in_force=self.signer_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
+                    )
+                    # Result is tuple: (tx, response, error)
+                    tx, response, error = result
 
-            return Order(
-                id=str(result.tx_hash if hasattr(result, 'tx_hash') else int(time.time() * 1000)),
-                client_id=client_id,
-                market=self.market,
-                side=side,
-                order_type=order_type,
-                size=size,
-                price=price,
-                status=OrderStatus.OPEN,
-                filled_size=0,
-                avg_fill_price=0,
-                timestamp=int(time.time() * 1000)
-            )
-        except ValueError:
-            # Re-raise ValueError (our own errors) without wrapping
-            raise
-        except Exception as e:
-            error_str = str(e)
-            # Check for invalid nonce error in unexpected exceptions too
-            if ("21104" in error_str or "invalid nonce" in error_str.lower()) and _retry_count < MAX_RETRIES:
-                retry_delay = 0.5 * (2 ** _retry_count)
-                logger.warning(f"Invalid nonce error (exception), retrying in {retry_delay}s (attempt {_retry_count + 1}/{MAX_RETRIES})...")
-                await asyncio.sleep(retry_delay)
-                await self._sync_nonces()
-                return await self.place_order(side, size, order_type, price, client_id, _retry_count + 1)
-            logger.error(f"Error placing order: {e}")
-            raise
+                    # Update last order time for spacing
+                    _last_order_time = int(time.time() * 1000)
+
+                    if error:
+                        error_str = str(error)
+                        # Check for invalid nonce error (code 21104)
+                        if "21104" in error_str or "invalid nonce" in error_str.lower():
+                            if _retry_count < MAX_RETRIES:
+                                retry_delay = 0.5 * (2 ** _retry_count)
+                                logger.warning(f"Invalid nonce error, retrying in {retry_delay}s (attempt {_retry_count + 1}/{MAX_RETRIES})...")
+                                await self._sync_nonces(force_refresh=True)
+                                await asyncio.sleep(retry_delay)
+                                return await self.place_order(side, size, order_type, price, client_id, _retry_count + 1)
+                        logger.error(f"Order failed: {error}")
+                        raise ValueError(f"Order failed: {error}")
+                    logger.info(f"Order response: {response}")
+
+                logger.info(f"Lighter order placed: {side.value} {size} @ {price or 'MARKET'}")
+
+                return Order(
+                    id=str(result.tx_hash if hasattr(result, 'tx_hash') else int(time.time() * 1000)),
+                    client_id=client_id,
+                    market=self.market,
+                    side=side,
+                    order_type=order_type,
+                    size=size,
+                    price=price,
+                    status=OrderStatus.OPEN,
+                    filled_size=0,
+                    avg_fill_price=0,
+                    timestamp=int(time.time() * 1000)
+                )
+            except ValueError:
+                # Re-raise ValueError (our own errors) without wrapping
+                raise
+            except Exception as e:
+                error_str = str(e)
+                # Check for invalid nonce error in unexpected exceptions too
+                if ("21104" in error_str or "invalid nonce" in error_str.lower()) and _retry_count < MAX_RETRIES:
+                    retry_delay = 0.5 * (2 ** _retry_count)
+                    logger.warning(f"Invalid nonce error (exception), retrying in {retry_delay}s (attempt {_retry_count + 1}/{MAX_RETRIES})...")
+                    await asyncio.sleep(retry_delay)
+                    await self._sync_nonces(force_refresh=True)
+                    return await self.place_order(side, size, order_type, price, client_id, _retry_count + 1)
+                logger.error(f"Error placing order: {e}")
+                raise
 
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel an order."""
