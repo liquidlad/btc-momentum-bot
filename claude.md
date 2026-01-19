@@ -409,6 +409,52 @@ btc-momentum-bot/
 
 - **STATUS: LIVE TESTING IN PROGRESS**
 
+### 2026-01-18 (Session 10 - Critical Bug Fixes & BB Consistency)
+
+- **CRITICAL BUG: Duplicate Order Prevention**
+  - Bot was entering positions repeatedly until margin exhausted
+  - Root cause: `active_trades` set AFTER order placed, so if order errored after execution, bot thought no position existed
+  - **Fix**: Optimistic locking - set `active_trades` BEFORE placing order
+  - Added smart error handling: clear lock on definitive failures (insufficient margin), keep locked on uncertain failures (timeouts)
+
+- **CRITICAL BUG: Shared SignerClient**
+  - Nonce errors when multiple markets traded sequentially
+  - Root cause: Each market had its own SignerClient with separate nonce counter
+  - **Fix**: All markets (BTC, ETH, SOL) now share single SignerClient instance
+  - Nonces stay in sync automatically across all markets
+
+- **Startup Position Check**
+  - Bot now checks exchange for existing positions on startup
+  - Prevents entering duplicate positions if bot restarts with open positions
+  - Logs warning and manages existing positions
+
+- **BB Calculation Consistency Fix**
+  - Problem: BB bands were different from Lighter chart
+  - Root cause: Bot collected prices at check interval (1 sec in position, 10 sec out)
+  - This meant BB used 40 sec of data in position vs 400 sec out of position
+  - **Fix**: Price collection now fixed at 10 sec intervals regardless of check frequency
+  - BB always uses ~6.7 min of data (40 samples × 10 sec)
+
+- **Parameter Changes**:
+  | Parameter | Old | New |
+  |-----------|-----|-----|
+  | Leverage | 20x | 15x |
+  | BB Period | 20 | 40 |
+  | Exit Check (in position) | 5 sec | 1 sec |
+  | Entry Check (no position) | 30 sec | 10 sec |
+  | Price Collection | Variable | Fixed 10 sec |
+
+- **Position Sizing with 15x**:
+  - $100 margin × 15x = $1,500 notional per trade
+  - Max loss: 0.3% × $1,500 = $4.50 per trade
+
+- **Files Modified**:
+  - `exchange/lighter_client.py` - Shared SignerClient, position attribute fix
+  - `strategy/rsi_bb_strategy.py` - Optimistic locking, startup check, fixed price collection
+  - `run_rsi_bb.py` - Leverage 15x, BB period 40
+
+- **STATUS: LIVE TESTING - BUGS FIXED**
+
 ### Remaining Work for Live Deployment
 1. ~~Integrate perp-dex-toolkit for Paradex/Lighter API~~ **DONE**
 2. ~~Implement real-time price feed~~ **DONE**
