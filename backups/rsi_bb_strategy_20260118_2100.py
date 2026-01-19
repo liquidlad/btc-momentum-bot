@@ -555,8 +555,17 @@ class RSIBBStrategy:
             logger.info("No existing positions found - starting fresh")
 
     async def stop(self):
-        """Stop strategy."""
+        """Stop strategy and close positions."""
         self.running = False
+
+        for asset, trade in self.active_trades.items():
+            if trade is not None:
+                try:
+                    bbo = await self.clients[asset].get_bbo()
+                    mid_price = (bbo.bid_price + bbo.ask_price) / 2
+                    await self.exit_short(asset, mid_price, "shutdown")
+                except Exception as e:
+                    logger.error(f"{asset}: Failed to close on shutdown: {e}")
 
         logger.info("=" * 70)
         logger.info("FINAL STATS")

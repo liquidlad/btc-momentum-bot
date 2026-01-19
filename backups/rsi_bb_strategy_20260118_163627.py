@@ -19,7 +19,6 @@ import asyncio
 import logging
 import csv
 import os
-import time
 from datetime import datetime
 from typing import Optional, Dict
 from dataclasses import dataclass
@@ -99,12 +98,6 @@ class RSIBBStrategy:
         self.active_trades: Dict[str, Optional[RSIBBTrade]] = {
             asset: None for asset in exchange_clients.keys()
         }
-
-        # Track last price collection time per asset (for consistent BB calculation)
-        self._last_price_time: Dict[str, float] = {
-            asset: 0 for asset in exchange_clients.keys()
-        }
-        self._price_collection_interval = 10  # Collect price every 10 sec for BB
 
         # Stats
         self.stats = {
@@ -263,20 +256,6 @@ class RSIBBStrategy:
 
         sl_price = current_price * (1 + self.config.stop_loss_pct / 100)
 
-        # CRITICAL: Set active_trades BEFORE placing order to prevent duplicate entries
-        # If order fails completely, we clear it. If order status is uncertain, we keep it
-        # to prevent placing duplicate orders that could drain margin.
-        self.active_trades[asset] = RSIBBTrade(
-            asset=asset,
-            entry_time=datetime.now(),
-            entry_price=current_price,  # Will update after fill
-            size=size,
-            stop_loss_price=sl_price,
-            best_price=current_price,
-            trailing_active=False,
-        )
-        self.active_trades[asset]._entry_rsi = entry_rsi
-
         try:
             from exchange.base import OrderSide, OrderType
 
@@ -288,9 +267,18 @@ class RSIBBStrategy:
 
             fill_price = order.avg_fill_price or current_price
 
-            # Update with actual fill price
-            self.active_trades[asset].entry_price = fill_price
-            self.active_trades[asset].best_price = fill_price
+            self.active_trades[asset] = RSIBBTrade(
+                asset=asset,
+                entry_time=datetime.now(),
+                entry_price=fill_price,
+                size=size,
+                stop_loss_price=sl_price,
+                best_price=fill_price,
+                trailing_active=False,
+            )
+
+            # Store entry RSI for logging
+            self.active_trades[asset]._entry_rsi = entry_rsi
 
             logger.info(
                 f"{asset}: ENTERED SHORT @ {fill_price:.2f}, RSI: {entry_rsi:.1f}, "
@@ -299,33 +287,7 @@ class RSIBBStrategy:
             )
 
         except Exception as e:
-            error_str = str(e).lower()
             logger.error(f"{asset}: Failed to enter short: {e}")
-
-            # Check if this is a DEFINITIVE failure (order definitely did not go through)
-            # vs an UNCERTAIN failure (order might have gone through)
-            definitive_failures = [
-                'insufficient margin',
-                'insufficient balance',
-                'not enough margin',
-                'margin requirement',
-                'invalid size',
-                'invalid amount',
-                'min order',
-                'minimum order',
-                'max position',
-                'position limit',
-            ]
-
-            is_definitive_failure = any(fail in error_str for fail in definitive_failures)
-
-            if is_definitive_failure:
-                # Order definitely failed - safe to clear and allow retry later
-                logger.warning(f"{asset}: Definitive failure - clearing position lock")
-                self.active_trades[asset] = None
-            else:
-                # Uncertain failure (timeout, network, etc.) - keep locked to be safe
-                logger.error(f"{asset}: KEEPING POSITION LOCKED - check exchange manually and restart bot if no position exists")
 
     async def exit_short(self, asset: str, current_price: float, reason: str):
         """Exit a short position."""
@@ -400,12 +362,7 @@ class RSIBBStrategy:
 
     async def update(self, asset: str, current_price: float):
         """Update strategy with new price."""
-        # Only add price to history every 10 seconds (for consistent BB calculation)
-        # Exit checks can happen every 1 second, but BB won't recalculate until new price added
-        current_time = time.time()
-        if current_time - self._last_price_time[asset] >= self._price_collection_interval:
-            self.price_history[asset].append(current_price)
-            self._last_price_time[asset] = current_time
+        self.price_history[asset].append(current_price)
 
         # Check exit first
         exit_reason = await self.check_exit(asset, current_price)
@@ -481,9 +438,9 @@ class RSIBBStrategy:
 
                 # Fast checks when in trade, slower for entries
                 if self.active_trades[asset]:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(5)
                 else:
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(30)
 
             except Exception as e:
                 logger.error(f"{asset}: Error in strategy loop: {e}")
@@ -496,10 +453,6 @@ class RSIBBStrategy:
         for asset, client in self.clients.items():
             if not client.connected:
                 await client.connect()
-
-        # CRITICAL: Check for existing positions on startup
-        # This prevents entering duplicate positions if bot restarts with open positions
-        await self._check_existing_positions()
 
         logger.info("=" * 70)
         logger.info("RSI+BB STRATEGY - Starting")
@@ -514,49 +467,18 @@ class RSIBBStrategy:
         tasks = [self.run_asset(asset) for asset in self.clients.keys()]
         await asyncio.gather(*tasks)
 
-    async def _check_existing_positions(self):
-        """Check for existing positions on exchange and populate active_trades."""
-        logger.info("Checking for existing positions on exchange...")
-
-        for asset, client in self.clients.items():
-            try:
-                positions = await client.get_positions()
-                for pos in positions:
-                    if pos.side == "SHORT" and pos.size > 0:
-                        # Found existing short position - create active trade entry
-                        logger.warning(
-                            f"{asset}: FOUND EXISTING SHORT POSITION - Size: {pos.size:.4f}, "
-                            f"Entry: {pos.entry_price:.2f}, PnL: ${pos.unrealized_pnl:.2f}"
-                        )
-
-                        # Create a trade entry so bot won't enter again
-                        sl_price = pos.entry_price * (1 + self.config.stop_loss_pct / 100)
-                        self.active_trades[asset] = RSIBBTrade(
-                            asset=asset,
-                            entry_time=datetime.now(),  # Unknown, use now
-                            entry_price=pos.entry_price,
-                            size=pos.size,
-                            stop_loss_price=sl_price,
-                            best_price=pos.entry_price,  # Unknown, use entry
-                            trailing_active=False,
-                        )
-                        self.active_trades[asset]._entry_rsi = 0  # Unknown
-
-                        logger.warning(f"{asset}: Will manage existing position (SL: {sl_price:.2f})")
-
-            except Exception as e:
-                logger.error(f"{asset}: Error checking positions: {e}")
-
-        # Summary
-        active_count = sum(1 for t in self.active_trades.values() if t is not None)
-        if active_count > 0:
-            logger.warning(f"Found {active_count} existing position(s) - bot will manage them")
-        else:
-            logger.info("No existing positions found - starting fresh")
-
     async def stop(self):
-        """Stop strategy."""
+        """Stop strategy and close positions."""
         self.running = False
+
+        for asset, trade in self.active_trades.items():
+            if trade is not None:
+                try:
+                    bbo = await self.clients[asset].get_bbo()
+                    mid_price = (bbo.bid_price + bbo.ask_price) / 2
+                    await self.exit_short(asset, mid_price, "shutdown")
+                except Exception as e:
+                    logger.error(f"{asset}: Failed to close on shutdown: {e}")
 
         logger.info("=" * 70)
         logger.info("FINAL STATS")

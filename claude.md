@@ -438,22 +438,28 @@ btc-momentum-bot/
 - **Parameter Changes**:
   | Parameter | Old | New |
   |-----------|-----|-----|
-  | Leverage | 20x | 15x |
+  | Leverage | 20x | 20x (tested 15x, reverted) |
   | BB Period | 20 | 40 |
   | Exit Check (in position) | 5 sec | 1 sec |
   | Entry Check (no position) | 30 sec | 10 sec |
   | Price Collection | Variable | Fixed 10 sec |
 
-- **Position Sizing with 15x**:
-  - $100 margin × 15x = $1,500 notional per trade
-  - Max loss: 0.3% × $1,500 = $4.50 per trade
+- **Position Sizing with 20x**:
+  - $100 margin × 20x = $2,000 notional per trade
+  - Max loss: 0.3% × $2,000 = $6.00 per trade
+
+- **Simplified Shutdown (Ctrl+C)**:
+  - Bot now just stops immediately without trying to close positions
+  - User requested: "when i do ctrl+c i don't want it to try and close all positions"
+  - Previous behavior was causing accidental LONG positions when closing SHORTS
+  - `stop()` method simplified to just set `running = False`
 
 - **Files Modified**:
   - `exchange/lighter_client.py` - Shared SignerClient, position attribute fix
-  - `strategy/rsi_bb_strategy.py` - Optimistic locking, startup check, fixed price collection
-  - `run_rsi_bb.py` - Leverage 15x, BB period 40
+  - `strategy/rsi_bb_strategy.py` - Optimistic locking, startup check, fixed price collection, simplified shutdown
+  - `run_rsi_bb.py` - Leverage 20x, BB period 40
 
-- **STATUS: LIVE TESTING - BUGS FIXED**
+- **STATUS: LIVE TESTING - ALL BUGS FIXED**
 
 ### Remaining Work for Live Deployment
 1. ~~Integrate perp-dex-toolkit for Paradex/Lighter API~~ **DONE**
