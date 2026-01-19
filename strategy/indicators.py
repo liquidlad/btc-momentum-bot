@@ -34,6 +34,20 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
+def bollinger_bands(series: pd.Series, period: int = 20, std_dev: float = 2.0) -> tuple:
+    """
+    Bollinger Bands.
+
+    Returns:
+        tuple: (middle_band, upper_band, lower_band)
+    """
+    middle = sma(series, period)
+    std = series.rolling(window=period).std()
+    upper = middle + (std * std_dev)
+    lower = middle - (std * std_dev)
+    return middle, upper, lower
+
+
 def calculate_indicators(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     """
     Calculate all strategy indicators.
@@ -68,6 +82,64 @@ def calculate_indicators(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     # Price position relative to EMAs
     df["above_ema_fast"] = df["close"] > df["ema_fast"]
     df["ema_fast_above_slow"] = df["ema_fast"] > df["ema_slow"]
+
+    return df
+
+
+def calculate_bb_rsi_indicators(df: pd.DataFrame, params: dict) -> pd.DataFrame:
+    """
+    Calculate RSI + Bollinger Band indicators for mean-reversion strategy.
+
+    Args:
+        df: DataFrame with OHLCV data
+        params: Strategy parameters dict
+
+    Returns:
+        DataFrame with added indicator columns
+    """
+    df = df.copy()
+
+    # Bollinger Bands
+    bb_period = params.get("bb_period", 20)
+    bb_std = params.get("bb_std", 2.0)
+    df["bb_middle"], df["bb_upper"], df["bb_lower"] = bollinger_bands(
+        df["close"], bb_period, bb_std
+    )
+
+    # RSI
+    rsi_period = params.get("rsi_period", 7)
+    df["rsi"] = rsi(df["close"], rsi_period)
+
+    # Price position relative to bands
+    df["above_upper_bb"] = df["close"] > df["bb_upper"]
+    df["below_lower_bb"] = df["close"] < df["bb_lower"]
+
+    return df
+
+
+def generate_bb_rsi_signals(df: pd.DataFrame, params: dict) -> pd.DataFrame:
+    """
+    Generate SHORT-only signals for RSI+BB mean-reversion strategy.
+
+    Entry: SHORT when price > upper BB AND RSI > threshold
+    Exit: Handled separately (trailing stop, lower BB, stop loss)
+
+    Args:
+        df: DataFrame with BB+RSI indicators
+        params: Strategy parameters with rsi_entry_threshold
+
+    Returns:
+        DataFrame with signal column (-1: short, 0: none)
+    """
+    df = df.copy()
+
+    rsi_threshold = params.get("rsi_entry_threshold", 75)
+
+    # SHORT entry: price above upper BB AND RSI overbought
+    short_entry = df["above_upper_bb"] & (df["rsi"] > rsi_threshold)
+
+    df["signal"] = 0
+    df.loc[short_entry, "signal"] = -1
 
     return df
 

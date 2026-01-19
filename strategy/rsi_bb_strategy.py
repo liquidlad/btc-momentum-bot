@@ -431,8 +431,7 @@ class RSIBBStrategy:
                             f"SL: {trade.stop_loss_price:.2f}, PnL: ${pnl_usd:+.2f}"
                         )
                         log_counter = 0
-                else:
-                    log_counter = 0
+                # Note: log_counter is already incremented and reset in the status logging blocks above
 
                 # Use bid for exit checks when in trade
                 await self.update(asset, bbo.bid_price if trade else mid_price)
