@@ -75,8 +75,8 @@ async def main(args):
     logger.info(f"Mode: {'LIVE' if args.live else 'PAPER'}")
     logger.info(f"Assets: {assets}")
     logger.info(f"Margin per trade: ${args.size}")
-    logger.info(f"Leverage: 20x")
-    logger.info(f"Position size: ${args.size * 20:.0f} notional per trade")
+    logger.info(f"Leverage: 15x")
+    logger.info(f"Position size: ${args.size * 15:.0f} notional per trade")
     logger.info(f"Exchange: Lighter (0% fees)")
     logger.info("=" * 70)
     logger.info("")
@@ -101,15 +101,16 @@ async def main(args):
         logger.info(f"Created client for {asset} ({market})")
 
     # Create strategy config
+    # BB period 40 with 10-sec polling = 400 sec = ~6.7 min of data
     config = RSIBBConfig(
-        bb_period=20,
+        bb_period=40,
         bb_std=2.0,
         rsi_period=7,
         stop_loss_pct=0.30,
         trailing_stop_pct=0.20,
         trailing_activation_pct=0.10,
         margin_per_trade=args.size,
-        leverage=20.0,
+        leverage=15.0,
     )
 
     # Per-asset RSI entry thresholds

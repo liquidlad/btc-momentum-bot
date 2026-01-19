@@ -29,6 +29,16 @@ _global_order_lock = asyncio.Lock()
 _last_order_time = 0
 _MIN_ORDER_SPACING_MS = 200  # Minimum 200ms between orders
 
+# CRITICAL: Share a single SignerClient across ALL LighterClient instances
+# Each SignerClient has its own internal nonce counter. If we create separate
+# SignerClients for BTC, ETH, SOL, they will each track nonces independently,
+# causing nonce collisions when orders are placed on different markets.
+_shared_signer_client = None
+_shared_order_api = None
+_shared_account_api = None
+_shared_tx_api = None
+_shared_account_index = None
+
 
 class LighterClient(ExchangeClient):
     """
@@ -62,6 +72,8 @@ class LighterClient(ExchangeClient):
 
     async def connect(self) -> bool:
         """Connect to Lighter."""
+        global _shared_signer_client, _shared_order_api, _shared_account_api, _shared_tx_api, _shared_account_index
+
         try:
             if self.paper_mode:
                 logger.info("Lighter: Running in PAPER mode (no real connection)")
@@ -87,29 +99,42 @@ class LighterClient(ExchangeClient):
             self.account_index = int(account_index)
             api_key_idx = int(api_key_index) if api_key_index else 0
 
-            # Get the base URL from configuration
-            config = Configuration()
-            base_url = config.host
+            # Use shared signer client to prevent nonce collisions
+            # All markets (BTC, ETH, SOL) must share the same SignerClient
+            # because they share the same account and nonce sequence
+            if _shared_signer_client is None:
+                # First client to connect initializes the shared resources
+                config = Configuration()
+                base_url = config.host
 
-            logger.info(f"Lighter: Connecting to {base_url}")
+                logger.info(f"Lighter: Connecting to {base_url}")
 
-            # Initialize signer client
-            self.signer_client = SignerClient(
-                url=base_url,
-                account_index=self.account_index,
-                api_private_keys={api_key_idx: private_key}
-            )
+                _shared_signer_client = SignerClient(
+                    url=base_url,
+                    account_index=self.account_index,
+                    api_private_keys={api_key_idx: private_key}
+                )
+                _shared_order_api = OrderApi()
+                _shared_account_api = AccountApi()
+                _shared_tx_api = TransactionApi()
+                _shared_account_index = self.account_index
 
-            # Initialize API clients
-            self.order_api = OrderApi()
-            self.account_api = AccountApi()
-            self.tx_api = TransactionApi()
+                logger.info(f"Lighter: Created shared SignerClient for account {self.account_index}")
+            else:
+                logger.info(f"Lighter: Reusing shared SignerClient for {self.market}")
+
+            # Use the shared clients
+            self.signer_client = _shared_signer_client
+            self.order_api = _shared_order_api
+            self.account_api = _shared_account_api
+            self.tx_api = _shared_tx_api
 
             # Get orderbook info to find the right orderbook ID for our market
             await self._fetch_orderbook_mapping()
 
-            # Sync nonces by fetching account state
-            await self._sync_nonces()
+            # Only sync nonces on first connect (shared client handles nonce tracking)
+            if _shared_account_index == self.account_index:
+                await self._sync_nonces()
 
             self.connected = True
             logger.info(f"Lighter: Connected successfully (account {self.account_index})")
@@ -141,19 +166,32 @@ class LighterClient(ExchangeClient):
                     if nonce is not None:
                         break
 
+                # Log available account attributes for debugging
+                acc_attrs = [a for a in dir(acc) if not a.startswith('_')]
+                logger.info(f"Lighter: Account attributes available: {acc_attrs}")
+
                 if nonce is not None:
                     logger.info(f"Lighter: Account nonce from server: {nonce}")
-                    # If the signer_client has a way to set nonce, use it
+                else:
+                    logger.warning(f"Lighter: Could not find nonce attribute on account object")
+
+                # Log signer_client attributes for debugging
+                signer_attrs = [a for a in dir(self.signer_client) if 'nonce' in a.lower()]
+                logger.info(f"Lighter: Signer client nonce-related attributes: {signer_attrs}")
+
+                # If the signer_client has a way to set nonce, use it
+                if nonce is not None:
                     if hasattr(self.signer_client, 'set_nonce'):
                         self.signer_client.set_nonce(int(nonce))
-                        logger.info(f"Lighter: Set signer nonce to {nonce}")
+                        logger.info(f"Lighter: Set signer nonce via set_nonce() to {nonce}")
                     elif hasattr(self.signer_client, '_nonce'):
                         self.signer_client._nonce = int(nonce)
                         logger.info(f"Lighter: Set signer _nonce to {nonce}")
-                else:
-                    # Log available attributes for debugging
-                    attrs = [a for a in dir(acc) if not a.startswith('_')]
-                    logger.debug(f"Lighter: Account attributes: {attrs}")
+                    elif hasattr(self.signer_client, 'nonce'):
+                        self.signer_client.nonce = int(nonce)
+                        logger.info(f"Lighter: Set signer nonce to {nonce}")
+                    else:
+                        logger.warning(f"Lighter: Could not find way to set nonce on signer_client")
         except Exception as e:
             logger.warning(f"Lighter: Could not sync nonce: {e}")
             import traceback
@@ -318,13 +356,10 @@ class LighterClient(ExchangeClient):
 
     async def disconnect(self) -> None:
         """Disconnect from Lighter."""
-        if self.signer_client and not self.paper_mode:
-            try:
-                await self.signer_client.close()
-            except Exception as e:
-                logger.warning(f"Error closing Lighter connection: {e}")
+        # Don't close the shared signer_client - it's used by all markets
+        # The shared client will be closed when the process exits
         self.connected = False
-        logger.info("Lighter: Disconnected")
+        logger.info(f"Lighter: Disconnected {self.market}")
 
     async def get_bbo(self) -> BBO:
         """Get best bid/offer."""
@@ -477,31 +512,15 @@ class LighterClient(ExchangeClient):
                         pos_market_id = getattr(pos, 'market_id', None) or getattr(pos, 'order_book_id', None)
 
                         # Try multiple possible attribute names for position size
-                        # Lighter SDK may use different names than 'size'
+                        # Lighter SDK uses 'position' for the actual size (negative=short, positive=long)
                         size = None
-                        for attr in ['size', 'base_amount', 'position_size', 'amount', 'qty', 'quantity']:
+                        for attr in ['position', 'size', 'base_amount', 'position_size', 'amount', 'qty', 'quantity']:
                             size = getattr(pos, attr, None)
                             if size is not None:
                                 break
 
-                        # If still None, log available attributes for debugging
-                        if size is None:
-                            attrs = [a for a in dir(pos) if not a.startswith('_')]
-                            logger.warning(f"Lighter: Could not find size attribute on position. Available: {attrs}")
-                            # Try to get any numeric value that looks like a size
-                            for attr in attrs:
-                                val = getattr(pos, attr, None)
-                                if isinstance(val, (int, float, str)):
-                                    try:
-                                        num_val = float(val)
-                                        if num_val != 0 and abs(num_val) < 1000000:  # Reasonable size
-                                            logger.info(f"Lighter: Using {attr}={num_val} as position size")
-                                            size = num_val
-                                            break
-                                    except (ValueError, TypeError):
-                                        pass
-
-                        if size is None:
+                        # If size is None or 0, skip this position (no active position)
+                        if size is None or size == 0:
                             continue
 
                         size = float(size)
