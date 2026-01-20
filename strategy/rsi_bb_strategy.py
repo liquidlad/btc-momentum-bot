@@ -342,13 +342,41 @@ class RSIBBStrategy:
         client = self.clients[asset]
 
         # CRITICAL: Check for existing position before entry
-        # This prevents entering SHORT when we already have a LONG (or vice versa)
         try:
             positions = await client.get_positions()
             for pos in positions:
                 if pos.size > 0.0001:
-                    logger.warning(f"{asset}: Existing {pos.side} position of {pos.size:.6f} - skipping entry")
-                    return
+                    if pos.side == "SHORT":
+                        # Existing SHORT - adopt it and monitor instead of entering new
+                        logger.info(f"{asset}: Found existing SHORT {pos.size:.6f} - adopting into active_trades")
+                        sl_price = pos.entry_price * (1 + self.config.stop_loss_pct / 100) if pos.entry_price > 0 else current_price * (1 + self.config.stop_loss_pct / 100)
+                        self.active_trades[asset] = RSIBBTrade(
+                            asset=asset,
+                            entry_time=datetime.now(),
+                            entry_price=pos.entry_price if pos.entry_price > 0 else current_price,
+                            size=pos.size,
+                            stop_loss_price=sl_price,
+                            best_price=current_price,  # Start tracking from now
+                            trailing_active=False,
+                        )
+                        self.active_trades[asset]._entry_rsi = entry_rsi
+                        logger.info(f"{asset}: Now monitoring existing SHORT - SL: {sl_price:.2f}")
+                        return
+                    elif pos.side == "LONG":
+                        # Existing LONG in SHORT-only strategy - close it
+                        logger.warning(f"{asset}: Found unexpected LONG {pos.size:.6f} - closing it")
+                        try:
+                            from exchange.base import OrderSide, OrderType
+                            await client.place_order(
+                                side=OrderSide.SELL,
+                                size=pos.size,
+                                order_type=OrderType.MARKET,
+                                slippage_pct=0.5,
+                            )
+                            logger.info(f"{asset}: LONG closed, will enter SHORT on next signal")
+                        except Exception as e:
+                            logger.error(f"{asset}: Failed to close LONG: {e}")
+                        return
         except Exception as e:
             logger.warning(f"{asset}: Could not check positions before entry: {e}")
             # Continue with entry if we can't check
