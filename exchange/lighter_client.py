@@ -166,18 +166,8 @@ class LighterClient(ExchangeClient):
                     if nonce is not None:
                         break
 
-                # Log available account attributes for debugging
-                acc_attrs = [a for a in dir(acc) if not a.startswith('_')]
-                logger.info(f"Lighter: Account attributes available: {acc_attrs}")
-
                 if nonce is not None:
-                    logger.info(f"Lighter: Account nonce from server: {nonce}")
-                else:
-                    logger.warning(f"Lighter: Could not find nonce attribute on account object")
-
-                # Log signer_client attributes for debugging
-                signer_attrs = [a for a in dir(self.signer_client) if 'nonce' in a.lower()]
-                logger.info(f"Lighter: Signer client nonce-related attributes: {signer_attrs}")
+                    logger.debug(f"Lighter: Account nonce from server: {nonce}")
 
                 # If the signer_client has a way to set nonce, use it
                 if nonce is not None:
@@ -565,53 +555,60 @@ class LighterClient(ExchangeClient):
                 acc = account.accounts[0]
                 if hasattr(acc, 'positions'):
                     for pos in (acc.positions or []):
-                        pos_market_id = getattr(pos, 'market_id', None) or getattr(pos, 'order_book_id', None)
-
-                        # Log all position attributes to debug side detection
-                        pos_attrs = {a: getattr(pos, a, None) for a in dir(pos) if not a.startswith('_') and not callable(getattr(pos, a, None))}
-                        logger.info(f"Lighter RAW position data: {pos_attrs}")
-
-                        # Try multiple possible attribute names for position size
-                        # Lighter SDK uses 'position' for the actual size (negative=short, positive=long)
-                        size = None
-                        for attr in ['position', 'size', 'base_amount', 'position_size', 'amount', 'qty', 'quantity']:
-                            size = getattr(pos, attr, None)
-                            if size is not None:
+                        # Try multiple attribute names for market ID
+                        pos_market_id = None
+                        for attr in ['market_id', 'order_book_id', 'orderbook_id', 'market_index', 'orderBookId', 'marketId']:
+                            pos_market_id = getattr(pos, attr, None)
+                            if pos_market_id is not None:
                                 break
 
-                        # If size is None or 0, skip this position (no active position)
-                        if size is None or size == 0:
+                        # Get position size - Lighter uses 'position' field (always positive)
+                        # and 'sign' field to indicate direction (1=LONG, -1=SHORT)
+                        pos_size_str = getattr(pos, 'position', None)
+                        pos_sign = getattr(pos, 'sign', None)
+
+                        if pos_size_str is None:
                             continue
 
-                        size = float(size)
-                        if pos_market_id == self._orderbook_id and size != 0:
-                            # Determine side - check for explicit side attribute first
-                            side = None
+                        pos_size = float(pos_size_str)
 
-                            # Check for explicit side/direction attributes
-                            for attr in ['side', 'direction', 'position_side', 'pos_side']:
-                                side_val = getattr(pos, attr, None)
-                                if side_val is not None:
-                                    side_str = str(side_val).upper()
-                                    if 'SHORT' in side_str or 'SELL' in side_str:
-                                        side = "SHORT"
-                                    elif 'LONG' in side_str or 'BUY' in side_str:
-                                        side = "LONG"
-                                    break
+                        # If size is 0, skip (no position)
+                        if pos_size == 0:
+                            continue
 
-                            # Check for is_long boolean
-                            if side is None:
-                                is_long = getattr(pos, 'is_long', None)
-                                if is_long is not None:
-                                    side = "LONG" if is_long else "SHORT"
+                        # CRITICAL: Apply sign to get actual direction
+                        # sign=1 means LONG, sign=-1 means SHORT
+                        # The position value is always positive, sign determines direction
+                        if pos_sign is not None:
+                            raw_size = pos_size * int(pos_sign)
+                        else:
+                            raw_size = pos_size  # Fallback if no sign field
 
-                            # Fall back to sign-based detection
-                            # Lighter: negative position = SHORT, positive = LONG
-                            if side is None:
-                                side = "LONG" if size > 0 else "SHORT"
+                        # Check if this position belongs to our market
+                        # Handle type mismatches (string vs int) by comparing both ways
+                        market_matches = False
+                        if pos_market_id is not None and self._orderbook_id is not None:
+                            try:
+                                market_matches = (int(pos_market_id) == int(self._orderbook_id))
+                            except (ValueError, TypeError):
+                                market_matches = (str(pos_market_id) == str(self._orderbook_id))
+                        elif pos_market_id is None:
+                            # If we can't find market_id, log warning but still include position
+                            # This is safer than missing positions
+                            logger.warning(f"Lighter: Position has no market_id attribute, assuming it matches {self.market}")
+                            market_matches = True
 
-                            # Log the raw values for debugging
-                            logger.info(f"Lighter: Raw position - market_id={pos_market_id}, size={size}, detected_side={side}")
+                        if not market_matches:
+                            logger.debug(f"Lighter: Skipping position - market_id {pos_market_id} doesn't match our {self._orderbook_id} ({self.market})")
+                            continue
+
+                        if raw_size != 0:
+                            # Determine side from the sign of raw_size
+                            # raw_size is already signed (position * sign)
+                            side = "LONG" if raw_size > 0 else "SHORT"
+                            size = abs(raw_size)
+
+                            logger.debug(f"Lighter: Position detected - {self.market} {side} {size:.6f}")
 
                             # Get entry price with fallback attribute names
                             entry_price = None
@@ -632,7 +629,7 @@ class LighterClient(ExchangeClient):
                             positions.append(Position(
                                 market=self.market,
                                 side=side,
-                                size=abs(size),
+                                size=size,  # Already absolute value from abs(raw_size)
                                 entry_price=entry_price,
                                 unrealized_pnl=unrealized_pnl,
                             ))
@@ -799,12 +796,12 @@ class LighterClient(ExchangeClient):
                 price_int = int(price_with_slippage * (10 ** price_decimals))
 
                 # Log the conversion for verification
-                logger.info(f"Order size conversion: {size:.6f} {symbol} -> {size_int} (decimals={size_decimals})")
+                logger.debug(f"Order size conversion: {size:.6f} {symbol} -> {size_int} (decimals={size_decimals})")
 
                 if order_type == OrderType.MARKET:
                     # Use create_market_order for market orders
                     # Parameters: market_index, client_order_index, base_amount, avg_execution_price, is_ask
-                    logger.info(f"Placing market order: market={self._orderbook_id}, size={size_int}, bbo_price={current_price:.2f}, max_price={price_with_slippage:.2f} ({slippage_tolerance*100:.1f}% slippage), is_ask={is_ask}")
+                    logger.debug(f"Placing market order: market={self._orderbook_id}, size={size_int}, bbo_price={current_price:.2f}, max_price={price_with_slippage:.2f} ({slippage_tolerance*100:.1f}% slippage), is_ask={is_ask}")
                     result = await self.signer_client.create_market_order(
                         market_index=self._orderbook_id,
                         client_order_index=client_order_idx,
@@ -836,14 +833,14 @@ class LighterClient(ExchangeClient):
                             return await self.place_order(side, size, order_type, price, client_id, _retry_count + 1, slippage_pct)
                         logger.error(f"Order failed: {error}")
                         raise ValueError(f"Order failed: {error}")
-                    logger.info(f"Order response: {response}")
+                    logger.debug(f"Order response: {response}")
                 else:
                     # Use create_order for limit orders
                     if price is None:
                         raise ValueError("Price required for limit orders")
 
                     limit_price_int = int(price * (10 ** price_decimals))
-                    logger.info(f"Placing limit order: market={self._orderbook_id}, size={size_int}, price={limit_price_int}, is_ask={is_ask}")
+                    logger.debug(f"Placing limit order: market={self._orderbook_id}, size={size_int}, price={limit_price_int}, is_ask={is_ask}")
                     result = await self.signer_client.create_order(
                         market_index=self._orderbook_id,
                         client_order_index=client_order_idx,
@@ -871,9 +868,9 @@ class LighterClient(ExchangeClient):
                                 return await self.place_order(side, size, order_type, price, client_id, _retry_count + 1)
                         logger.error(f"Order failed: {error}")
                         raise ValueError(f"Order failed: {error}")
-                    logger.info(f"Order response: {response}")
+                    logger.debug(f"Order response: {response}")
 
-                logger.info(f"Lighter order placed: {side.value} {size} @ {price or 'MARKET'}")
+                logger.debug(f"Lighter order placed: {side.value} {size} @ {price or 'MARKET'}")
 
                 return Order(
                     id=str(result.tx_hash if hasattr(result, 'tx_hash') else int(time.time() * 1000)),

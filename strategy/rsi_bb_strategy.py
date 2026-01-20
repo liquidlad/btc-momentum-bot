@@ -333,53 +333,13 @@ class RSIBBStrategy:
                 logger.error(f"{asset}: Failed to get positions: {e}")
 
     async def enter_short(self, asset: str, current_price: float, entry_rsi: float):
-        """Enter a short position."""
+        """Enter a short position. Only called when update() confirms no position exists."""
         # Check if halted
         if self.halted.get(asset, False):
             logger.warning(f"{asset}: Trading halted - skipping entry")
             return
 
         client = self.clients[asset]
-
-        # CRITICAL: Check for existing position before entry
-        try:
-            positions = await client.get_positions()
-            for pos in positions:
-                if pos.size > 0.0001:
-                    if pos.side == "SHORT":
-                        # Existing SHORT - adopt it and monitor instead of entering new
-                        logger.info(f"{asset}: Found existing SHORT {pos.size:.6f} - adopting into active_trades")
-                        sl_price = pos.entry_price * (1 + self.config.stop_loss_pct / 100) if pos.entry_price > 0 else current_price * (1 + self.config.stop_loss_pct / 100)
-                        self.active_trades[asset] = RSIBBTrade(
-                            asset=asset,
-                            entry_time=datetime.now(),
-                            entry_price=pos.entry_price if pos.entry_price > 0 else current_price,
-                            size=pos.size,
-                            stop_loss_price=sl_price,
-                            best_price=current_price,  # Start tracking from now
-                            trailing_active=False,
-                        )
-                        self.active_trades[asset]._entry_rsi = entry_rsi
-                        logger.info(f"{asset}: Now monitoring existing SHORT - SL: {sl_price:.2f}")
-                        return
-                    elif pos.side == "LONG":
-                        # Existing LONG in SHORT-only strategy - close it
-                        logger.warning(f"{asset}: Found unexpected LONG {pos.size:.6f} - closing it")
-                        try:
-                            from exchange.base import OrderSide, OrderType
-                            await client.place_order(
-                                side=OrderSide.SELL,
-                                size=pos.size,
-                                order_type=OrderType.MARKET,
-                                slippage_pct=0.5,
-                            )
-                            logger.info(f"{asset}: LONG closed, will enter SHORT on next signal")
-                        except Exception as e:
-                            logger.error(f"{asset}: Failed to close LONG: {e}")
-                        return
-        except Exception as e:
-            logger.warning(f"{asset}: Could not check positions before entry: {e}")
-            # Continue with entry if we can't check
 
         notional = self.config.margin_per_trade * self.config.leverage
         size = notional / current_price
@@ -619,33 +579,96 @@ class RSIBBStrategy:
                 pass
 
     async def update(self, asset: str, current_price: float):
-        """Update strategy with new price."""
+        """Update strategy with new price. ALWAYS uses real exchange positions."""
         # Check if asset is halted
         if self.halted.get(asset, False):
             return  # Skip all processing for halted assets
 
         # Only add price to history every 10 seconds (for consistent BB calculation)
-        # Exit checks can happen every 1 second, but BB won't recalculate until new price added
         current_time = time.time()
         if current_time - self._last_price_time[asset] >= self._price_collection_interval:
             self.price_history[asset].append(current_price)
             self._last_price_time[asset] = current_time
 
-        # Check position sanity periodically (every ~60 seconds when in position)
-        if self.active_trades[asset] is not None:
-            if not await self._check_position_sanity(asset, current_price):
-                return  # Halted - don't process further
+        # ALWAYS check real exchange position - this is the source of truth
+        client = self.clients[asset]
+        try:
+            positions = await client.get_positions()
+            real_short = None
+            real_long = None
 
-        # Check exit first
-        exit_reason = await self.check_exit(asset, current_price)
-        if exit_reason:
-            await self.exit_short(asset, current_price, exit_reason)
-            return
+            for pos in positions:
+                if pos.size > 0.0001:
+                    if pos.side == "SHORT":
+                        real_short = pos
+                    elif pos.side == "LONG":
+                        real_long = pos
 
-        # Check entry
-        entry_rsi = await self.check_entry(asset, current_price)
-        if entry_rsi is not None:
-            await self.enter_short(asset, current_price, entry_rsi)
+            # If we have a LONG in this SHORT-only strategy, close it
+            if real_long is not None:
+                logger.warning(f"{asset}: Found unexpected LONG {real_long.size:.6f} - closing")
+                await self._close_position(asset, real_long)
+                return
+
+            # If we have a SHORT, manage it
+            if real_short is not None:
+                # Adopt into active_trades if not already tracked
+                if self.active_trades[asset] is None:
+                    logger.info(f"{asset}: Adopting real SHORT {real_short.size:.6f} into tracking")
+                    sl_price = real_short.entry_price * (1 + self.config.stop_loss_pct / 100) if real_short.entry_price > 0 else current_price * (1 + self.config.stop_loss_pct / 100)
+                    self.active_trades[asset] = RSIBBTrade(
+                        asset=asset,
+                        entry_time=datetime.now(),
+                        entry_price=real_short.entry_price if real_short.entry_price > 0 else current_price,
+                        size=real_short.size,
+                        stop_loss_price=sl_price,
+                        best_price=current_price,
+                        trailing_active=False,
+                    )
+                    self.active_trades[asset]._entry_rsi = 0
+
+                # Update tracked size to match reality
+                if self.active_trades[asset] is not None:
+                    self.active_trades[asset].size = real_short.size
+
+                # Check position sanity
+                if not await self._check_position_sanity(asset, current_price):
+                    return
+
+                # Check exit conditions
+                exit_reason = await self.check_exit(asset, current_price)
+                if exit_reason:
+                    await self.exit_short(asset, current_price, exit_reason)
+                return
+
+            # No position - clear tracking if stale and check for entry
+            if self.active_trades[asset] is not None:
+                logger.info(f"{asset}: No real position but had tracked - clearing stale tracking")
+                self.active_trades[asset] = None
+
+            # Check entry
+            entry_rsi = await self.check_entry(asset, current_price)
+            if entry_rsi is not None:
+                await self.enter_short(asset, current_price, entry_rsi)
+
+        except Exception as e:
+            logger.error(f"{asset}: Error checking positions: {e}")
+
+    async def _close_position(self, asset: str, pos):
+        """Close a position (used for closing unexpected LONGs)."""
+        client = self.clients[asset]
+        try:
+            from exchange.base import OrderSide, OrderType
+            close_side = OrderSide.SELL if pos.side == "LONG" else OrderSide.BUY
+            await client.place_order(
+                side=close_side,
+                size=pos.size,
+                order_type=OrderType.MARKET,
+                slippage_pct=0.5,
+            )
+            logger.info(f"{asset}: Closed {pos.side} position of {pos.size:.6f}")
+        except Exception as e:
+            logger.error(f"{asset}: Failed to close position: {e}")
 
     async def run_asset(self, asset: str):
         """Run strategy loop for a single asset."""
@@ -731,6 +754,47 @@ class RSIBBStrategy:
                 logger.error(f"{asset}: Error in strategy loop: {e}")
                 await asyncio.sleep(5)
 
+    async def _bootstrap_price_history(self):
+        """
+        Bootstrap price history from candles so bot can trade immediately.
+        Fetches recent 1-minute candles and uses close prices.
+        """
+        import time as time_module
+
+        logger.info("Bootstrapping price history from candles...")
+
+        for asset, client in self.clients.items():
+            try:
+                # Fetch last 15 minutes of 1-minute candles
+                end_time = int(time_module.time() * 1000)
+                start_time = end_time - (15 * 60 * 1000)  # 15 minutes ago
+
+                candles = await client.get_candles(
+                    resolution="1",  # 1-minute candles
+                    start_time=start_time,
+                    end_time=end_time
+                )
+
+                if candles:
+                    # Use close prices from candles
+                    # For better granularity, use OHLC from each candle (4 prices per candle)
+                    for candle in candles:
+                        # Add open, high, low, close to simulate more granular data
+                        self.price_history[asset].append(candle.open)
+                        self.price_history[asset].append(candle.high)
+                        self.price_history[asset].append(candle.low)
+                        self.price_history[asset].append(candle.close)
+
+                    # Initialize last price time so collection continues properly
+                    self._last_price_time[asset] = time_module.time()
+
+                    logger.info(f"{asset}: Bootstrapped {len(self.price_history[asset])} prices from {len(candles)} candles")
+                else:
+                    logger.warning(f"{asset}: No candles available for bootstrap")
+
+            except Exception as e:
+                logger.warning(f"{asset}: Failed to bootstrap price history: {e}")
+
     async def run(self):
         """Run strategy for all assets."""
         self.running = True
@@ -742,6 +806,9 @@ class RSIBBStrategy:
         # CRITICAL: Check for existing positions on startup
         # This prevents entering duplicate positions if bot restarts with open positions
         await self._check_existing_positions()
+
+        # Bootstrap price history from candles for immediate trading
+        await self._bootstrap_price_history()
 
         logger.info("=" * 70)
         logger.info("RSI+BB STRATEGY - Starting")
