@@ -567,9 +567,9 @@ class LighterClient(ExchangeClient):
                     for pos in (acc.positions or []):
                         pos_market_id = getattr(pos, 'market_id', None) or getattr(pos, 'order_book_id', None)
 
-                        # Debug: log all position attributes once
-                        pos_attrs = [a for a in dir(pos) if not a.startswith('_')]
-                        logger.debug(f"Lighter position attributes: {pos_attrs}")
+                        # Log all position attributes to debug side detection
+                        pos_attrs = {a: getattr(pos, a, None) for a in dir(pos) if not a.startswith('_') and not callable(getattr(pos, a, None))}
+                        logger.info(f"Lighter RAW position data: {pos_attrs}")
 
                         # Try multiple possible attribute names for position size
                         # Lighter SDK uses 'position' for the actual size (negative=short, positive=long)
