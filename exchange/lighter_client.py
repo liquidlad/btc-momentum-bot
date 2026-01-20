@@ -461,21 +461,52 @@ class LighterClient(ExchangeClient):
             logger.error(f"Error fetching BBO: {e}")
             raise
 
-    async def get_candles(self, resolution: str, start_time: int, end_time: int) -> List[Candle]:
-        """Get historical candles."""
+    async def get_candles(self, resolution: str = "60", count_back: int = 50) -> List[Candle]:
+        """
+        Get historical candles.
+
+        Args:
+            resolution: Candle resolution in seconds (e.g., "60" for 1-min)
+            count_back: Number of candles to fetch
+        """
         if self.paper_mode:
             return []
 
         try:
             from lighter import CandlestickApi
+            import inspect
+
             candle_api = CandlestickApi()
 
-            candles = await candle_api.candlesticks(
-                market_id=self._orderbook_id,
-                resolution=resolution,
-                start_time=start_time,
-                end_time=end_time
-            )
+            # Lighter API uses start_timestamp, end_timestamp, count_back
+            end_ts = int(time.time())
+            start_ts = end_ts - (count_back * 60)  # Assume 1-min candles
+
+            # Handle both sync and async API methods
+            method = candle_api.candlesticks
+            if inspect.iscoroutinefunction(method):
+                candles = await method(
+                    market_id=self._orderbook_id,
+                    resolution=resolution,
+                    start_timestamp=start_ts,
+                    end_timestamp=end_ts,
+                    count_back=count_back
+                )
+            else:
+                loop = asyncio.get_event_loop()
+                candles = await loop.run_in_executor(
+                    None,
+                    lambda: method(
+                        market_id=self._orderbook_id,
+                        resolution=resolution,
+                        start_timestamp=start_ts,
+                        end_timestamp=end_ts,
+                        count_back=count_back
+                    )
+                )
+
+            if not candles or not candles.candlesticks:
+                return []
 
             return [
                 Candle(

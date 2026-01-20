@@ -546,6 +546,51 @@ btc-momentum-bot/
 
 - **STATUS: FIXES IMPLEMENTED - Ready for testing**
 
+### 2026-01-19 (Session 12 - Critical Position Sign Fix + Candle Bootstrap)
+
+- **CRITICAL BUG FIXED: Position Side Detection**
+
+  **Root Cause:**
+  - Lighter API returns `position` (always positive) and `sign` field separately
+  - `sign: 1` = LONG, `sign: -1` = SHORT
+  - Old code only checked if `position` was positive/negative - it was ALWAYS positive!
+
+  **Result of Bug:**
+  - Bot entered SHORT via SELL → created SHORT position
+  - Position showed `position: 0.0216, sign: -1`
+  - Code ignored `sign`, saw positive `position`, thought it was LONG
+  - Code tried to "close unexpected LONG" by SELLing again
+  - This made SHORT BIGGER (0.02 → 0.04 → 0.065...)
+  - Infinite loop until margin exhausted
+
+  **Fix:**
+  ```python
+  # OLD (wrong): raw_size = float(position)  # always positive!
+  # NEW (correct): raw_size = float(position) * int(sign)
+  ```
+  - SHORT: `0.0216 * -1 = -0.0216` → detected as SHORT ✓
+  - LONG: `0.0216 * 1 = 0.0216` → detected as LONG ✓
+
+- **NEW FEATURE: Candle Bootstrap at Startup**
+
+  - Problem: Bot needed ~7 minutes to collect 40 price samples for BB calculation
+  - Solution: Bootstrap from Binance public API at startup
+  - Fetches 15 1-minute candles, extracts OHLC → 60 price points
+  - Bot can trade immediately after startup
+
+  Note: Lighter candle API returns 403 Forbidden, so using Binance instead
+
+- **Reduced Log Verbosity**
+  - Changed many INFO logs to DEBUG level
+  - Removed: Order size conversion, order response details, nonce sync info
+  - Kept: Entry/exit signals, position changes, errors
+
+- **Files Modified:**
+  - `exchange/lighter_client.py` - Position sign fix, candle API update, reduced logging
+  - `strategy/rsi_bb_strategy.py` - Binance candle bootstrap, reduced logging
+
+- **STATUS: LIVE AND WORKING**
+
 ### Remaining Work for Live Deployment
 1. ~~Integrate perp-dex-toolkit for Paradex/Lighter API~~ **DONE**
 2. ~~Implement real-time price feed~~ **DONE**

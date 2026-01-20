@@ -756,44 +756,48 @@ class RSIBBStrategy:
 
     async def _bootstrap_price_history(self):
         """
-        Bootstrap price history from candles so bot can trade immediately.
-        Fetches recent 1-minute candles and uses close prices.
+        Bootstrap price history from Binance candles so bot can trade immediately.
+        Uses Binance public API (no auth needed) for reliable candle data.
         """
         import time as time_module
+        import aiohttp
 
-        logger.info("Bootstrapping price history from candles...")
+        logger.info("Bootstrapping price history from Binance...")
 
-        for asset, client in self.clients.items():
-            try:
-                # Fetch last 15 minutes of 1-minute candles
-                end_time = int(time_module.time() * 1000)
-                start_time = end_time - (15 * 60 * 1000)  # 15 minutes ago
+        # Map our assets to Binance symbols
+        binance_symbols = {
+            "BTC": "BTCUSDT",
+            "ETH": "ETHUSDT",
+            "SOL": "SOLUSDT",
+        }
 
-                candles = await client.get_candles(
-                    resolution="1",  # 1-minute candles
-                    start_time=start_time,
-                    end_time=end_time
-                )
+        async with aiohttp.ClientSession() as session:
+            for asset, client in self.clients.items():
+                try:
+                    symbol = binance_symbols.get(asset)
+                    if not symbol:
+                        logger.warning(f"{asset}: No Binance symbol mapping")
+                        continue
 
-                if candles:
-                    # Use close prices from candles
-                    # For better granularity, use OHLC from each candle (4 prices per candle)
-                    for candle in candles:
-                        # Add open, high, low, close to simulate more granular data
-                        self.price_history[asset].append(candle.open)
-                        self.price_history[asset].append(candle.high)
-                        self.price_history[asset].append(candle.low)
-                        self.price_history[asset].append(candle.close)
+                    # Fetch 15 1-minute candles from Binance
+                    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=15"
+                    async with session.get(url) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            # Binance kline format: [open_time, open, high, low, close, volume, ...]
+                            for candle in data:
+                                self.price_history[asset].append(float(candle[1]))  # open
+                                self.price_history[asset].append(float(candle[2]))  # high
+                                self.price_history[asset].append(float(candle[3]))  # low
+                                self.price_history[asset].append(float(candle[4]))  # close
 
-                    # Initialize last price time so collection continues properly
-                    self._last_price_time[asset] = time_module.time()
+                            self._last_price_time[asset] = time_module.time()
+                            logger.info(f"{asset}: Bootstrapped {len(self.price_history[asset])} prices from {len(data)} Binance candles")
+                        else:
+                            logger.warning(f"{asset}: Binance API returned {resp.status}")
 
-                    logger.info(f"{asset}: Bootstrapped {len(self.price_history[asset])} prices from {len(candles)} candles")
-                else:
-                    logger.warning(f"{asset}: No candles available for bootstrap")
-
-            except Exception as e:
-                logger.warning(f"{asset}: Failed to bootstrap price history: {e}")
+                except Exception as e:
+                    logger.warning(f"{asset}: Failed to bootstrap from Binance: {e}")
 
     async def run(self):
         """Run strategy for all assets."""
