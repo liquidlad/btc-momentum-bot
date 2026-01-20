@@ -567,6 +567,10 @@ class LighterClient(ExchangeClient):
                     for pos in (acc.positions or []):
                         pos_market_id = getattr(pos, 'market_id', None) or getattr(pos, 'order_book_id', None)
 
+                        # Debug: log all position attributes once
+                        pos_attrs = [a for a in dir(pos) if not a.startswith('_')]
+                        logger.debug(f"Lighter position attributes: {pos_attrs}")
+
                         # Try multiple possible attribute names for position size
                         # Lighter SDK uses 'position' for the actual size (negative=short, positive=long)
                         size = None
@@ -581,6 +585,34 @@ class LighterClient(ExchangeClient):
 
                         size = float(size)
                         if pos_market_id == self._orderbook_id and size != 0:
+                            # Determine side - check for explicit side attribute first
+                            side = None
+
+                            # Check for explicit side/direction attributes
+                            for attr in ['side', 'direction', 'position_side', 'pos_side']:
+                                side_val = getattr(pos, attr, None)
+                                if side_val is not None:
+                                    side_str = str(side_val).upper()
+                                    if 'SHORT' in side_str or 'SELL' in side_str:
+                                        side = "SHORT"
+                                    elif 'LONG' in side_str or 'BUY' in side_str:
+                                        side = "LONG"
+                                    break
+
+                            # Check for is_long boolean
+                            if side is None:
+                                is_long = getattr(pos, 'is_long', None)
+                                if is_long is not None:
+                                    side = "LONG" if is_long else "SHORT"
+
+                            # Fall back to sign-based detection
+                            # Lighter: negative position = SHORT, positive = LONG
+                            if side is None:
+                                side = "LONG" if size > 0 else "SHORT"
+
+                            # Log the raw values for debugging
+                            logger.info(f"Lighter: Raw position - market_id={pos_market_id}, size={size}, detected_side={side}")
+
                             # Get entry price with fallback attribute names
                             entry_price = None
                             for attr in ['entry_price', 'avg_entry_price', 'average_price', 'price']:
@@ -599,7 +631,7 @@ class LighterClient(ExchangeClient):
 
                             positions.append(Position(
                                 market=self.market,
-                                side="LONG" if size > 0 else "SHORT",
+                                side=side,
                                 size=abs(size),
                                 entry_price=entry_price,
                                 unrealized_pnl=unrealized_pnl,
