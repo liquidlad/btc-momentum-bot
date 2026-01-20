@@ -263,8 +263,8 @@ class RSIBBStrategy:
         """
         Check if position size is within safe limits.
         If position exceeds 2x expected size:
-        1. Attempt ONE emergency close
-        2. Halt ALL assets (not just this one)
+        1. Close ALL positions on ALL assets (using exchange sizes)
+        2. Halt ALL trading
         Returns False if halted.
         """
         if self.halted.get(asset, False):
@@ -286,31 +286,20 @@ class RSIBBStrategy:
                     logger.error(f"{asset}: Current price: {current_price:.2f}")
                     logger.error(f"{asset}: Unrealized PnL: ${pos.unrealized_pnl:.2f}")
 
-                    # Attempt ONE emergency close
-                    logger.error(f"{asset}: Attempting emergency close of {pos.size:.6f} {pos.side}...")
-                    try:
-                        from exchange.base import OrderSide, OrderType
-                        close_side = OrderSide.SELL if pos.side == "LONG" else OrderSide.BUY
-                        await client.place_order(
-                            side=close_side,
-                            size=pos.size,
-                            order_type=OrderType.MARKET,
-                            slippage_pct=1.0,  # 1% slippage for emergency
-                        )
-                        logger.error(f"{asset}: Emergency close order sent")
-                    except Exception as close_err:
-                        logger.error(f"{asset}: Emergency close FAILED: {close_err}")
+                    # Close ALL positions on ALL assets
+                    logger.error(f"=== CLOSING ALL POSITIONS ===")
+                    await self._emergency_close_all()
 
                     # Halt ALL assets
                     logger.error(f"=== HALTING ALL TRADING ===")
                     for a in self.halted.keys():
                         self.halted[a] = True
 
-                    # Clear all active trades to prevent further exit attempts
+                    # Clear all active trades
                     for a in self.active_trades.keys():
                         self.active_trades[a] = None
 
-                    logger.error(f"All assets halted. Review positions on Lighter and restart bot.")
+                    logger.error(f"All positions closed, all assets halted. Restart bot to resume.")
                     return False
 
             return True
@@ -318,6 +307,30 @@ class RSIBBStrategy:
         except Exception as e:
             logger.error(f"{asset}: Error checking position sanity: {e}")
             return True  # Don't halt on error, but log it
+
+    async def _emergency_close_all(self):
+        """Emergency close ALL positions on ALL assets using exchange sizes."""
+        from exchange.base import OrderSide, OrderType
+
+        for asset, client in self.clients.items():
+            try:
+                positions = await client.get_positions()
+                for pos in positions:
+                    if pos.size > 0.0001:
+                        logger.error(f"{asset}: Closing {pos.size:.6f} {pos.side}...")
+                        close_side = OrderSide.SELL if pos.side == "LONG" else OrderSide.BUY
+                        try:
+                            await client.place_order(
+                                side=close_side,
+                                size=pos.size,  # Use EXCHANGE size
+                                order_type=OrderType.MARKET,
+                                slippage_pct=1.0,  # 1% slippage for emergency
+                            )
+                            logger.error(f"{asset}: Close order sent for {pos.size:.6f} {pos.side}")
+                        except Exception as e:
+                            logger.error(f"{asset}: Failed to close {pos.side}: {e}")
+            except Exception as e:
+                logger.error(f"{asset}: Failed to get positions: {e}")
 
     async def enter_short(self, asset: str, current_price: float, entry_rsi: float):
         """Enter a short position."""
