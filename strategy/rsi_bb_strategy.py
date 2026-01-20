@@ -115,6 +115,11 @@ class RSIBBStrategy:
             for asset in exchange_clients.keys()
         }
 
+        # Halted assets - when True, no orders will be placed for that asset
+        self.halted: Dict[str, bool] = {
+            asset: False for asset in exchange_clients.keys()
+        }
+
         self.running = False
 
         # Trade history CSV
@@ -254,9 +259,60 @@ class RSIBBStrategy:
 
         return None
 
+    async def _check_position_sanity(self, asset: str, current_price: float) -> bool:
+        """
+        Check if position size is within safe limits.
+        Returns False and halts if position exceeds 2x expected size.
+        """
+        if self.halted.get(asset, False):
+            return False  # Already halted
+
+        try:
+            client = self.clients[asset]
+            positions = await client.get_positions()
+
+            # Expected max size based on config
+            expected_size = (self.config.margin_per_trade * self.config.leverage) / current_price
+            max_allowed = expected_size * 2  # 2x threshold
+
+            for pos in positions:
+                if pos.size > max_allowed:
+                    logger.error(f"{asset}: === EMERGENCY HALT ===")
+                    logger.error(f"{asset}: Position size {pos.size:.6f} {pos.side} exceeds max allowed {max_allowed:.6f}")
+                    logger.error(f"{asset}: Expected size: {expected_size:.6f}")
+                    logger.error(f"{asset}: Current price: {current_price:.2f}")
+                    logger.error(f"{asset}: Unrealized PnL: ${pos.unrealized_pnl:.2f}")
+                    logger.error(f"{asset}: ACTION REQUIRED - Close manually on Lighter or restart bot")
+                    logger.error(f"{asset}: === TRADING HALTED FOR THIS ASSET ===")
+                    self.halted[asset] = True
+                    return False
+
+            return True
+
+        except Exception as e:
+            logger.error(f"{asset}: Error checking position sanity: {e}")
+            return True  # Don't halt on error, but log it
+
     async def enter_short(self, asset: str, current_price: float, entry_rsi: float):
         """Enter a short position."""
+        # Check if halted
+        if self.halted.get(asset, False):
+            logger.warning(f"{asset}: Trading halted - skipping entry")
+            return
+
         client = self.clients[asset]
+
+        # CRITICAL: Check for existing position before entry
+        # This prevents entering SHORT when we already have a LONG (or vice versa)
+        try:
+            positions = await client.get_positions()
+            for pos in positions:
+                if pos.size > 0.0001:
+                    logger.warning(f"{asset}: Existing {pos.side} position of {pos.size:.6f} - skipping entry")
+                    return
+        except Exception as e:
+            logger.warning(f"{asset}: Could not check positions before entry: {e}")
+            # Continue with entry if we can't check
 
         notional = self.config.margin_per_trade * self.config.leverage
         size = notional / current_price
@@ -358,24 +414,62 @@ class RSIBBStrategy:
         if trade is None:
             return
 
+        # Check if halted
+        if self.halted.get(asset, False):
+            logger.warning(f"{asset}: Trading halted - skipping exit")
+            return
+
         client = self.clients[asset]
 
         try:
             from exchange.base import OrderSide, OrderType
 
+            # CRITICAL: Always get actual position from exchange before exit
+            # This prevents sending wrong size and creating opposite positions
+            positions = await client.get_positions()
+            actual_short = None
+            actual_long = None
+
+            for pos in positions:
+                if pos.side == "SHORT" and pos.size > 0.0001:
+                    actual_short = pos
+                elif pos.side == "LONG" and pos.size > 0.0001:
+                    actual_long = pos
+
+            # Check for position mismatch - found LONG instead of SHORT
+            if actual_long is not None:
+                logger.error(f"{asset}: POSITION MISMATCH - Expected SHORT but found LONG {actual_long.size:.6f}!")
+                logger.error(f"{asset}: Clearing tracked trade - DO NOT send BUY order")
+                self.active_trades[asset] = None
+                return  # Do NOT send a BUY order - would make LONG bigger
+
+            # No SHORT on exchange - nothing to close
+            if actual_short is None:
+                logger.warning(f"{asset}: No SHORT position on exchange - already closed?")
+                self.active_trades[asset] = None
+                return  # Nothing to close
+
+            # Use ACTUAL exchange size, not tracked size
+            size_to_close = actual_short.size
+
+            if abs(size_to_close - trade.size) > 0.0001:
+                logger.warning(f"{asset}: Size mismatch - tracked: {trade.size:.6f}, exchange: {size_to_close:.6f}")
+                logger.info(f"{asset}: Using exchange size {size_to_close:.6f} for exit")
+
             # Use place_order_until_filled for critical exit orders
-            # This retries with increasing slippage until the order fills
+            # Pass closing_side so verification knows what to look for
             if hasattr(client, 'place_order_until_filled'):
                 order = await client.place_order_until_filled(
                     side=OrderSide.BUY,
-                    size=trade.size,
+                    size=size_to_close,  # Use EXCHANGE size
                     max_attempts=5,
+                    closing_side="SHORT",  # Tell verification we're closing a SHORT
                 )
             else:
                 # Fallback to regular place_order for clients without the method
                 order = await client.place_order(
                     side=OrderSide.BUY,
-                    size=trade.size,
+                    size=size_to_close,  # Use EXCHANGE size
                     order_type=OrderType.MARKET,
                 )
 
@@ -459,12 +553,21 @@ class RSIBBStrategy:
 
     async def update(self, asset: str, current_price: float):
         """Update strategy with new price."""
+        # Check if asset is halted
+        if self.halted.get(asset, False):
+            return  # Skip all processing for halted assets
+
         # Only add price to history every 10 seconds (for consistent BB calculation)
         # Exit checks can happen every 1 second, but BB won't recalculate until new price added
         current_time = time.time()
         if current_time - self._last_price_time[asset] >= self._price_collection_interval:
             self.price_history[asset].append(current_price)
             self._last_price_time[asset] = current_time
+
+        # Check position sanity periodically (every ~60 seconds when in position)
+        if self.active_trades[asset] is not None:
+            if not await self._check_position_sanity(asset, current_price):
+                return  # Halted - don't process further
 
         # Check exit first
         exit_reason = await self.check_exit(asset, current_price)
@@ -484,8 +587,14 @@ class RSIBBStrategy:
         logger.info(f"{asset}: Starting RSI+BB strategy (RSI entry > {self.rsi_entry.get(asset, 70)})")
         log_counter = 0
         first_bbo = True
+        dust_check_counter = 0
 
         while self.running:
+            # Check if halted
+            if self.halted.get(asset, False):
+                logger.debug(f"{asset}: Trading halted - sleeping")
+                await asyncio.sleep(30)  # Check less frequently when halted
+                continue
             try:
                 bbo = await client.get_bbo()
                 mid_price = (bbo.bid_price + bbo.ask_price) / 2
@@ -538,6 +647,13 @@ class RSIBBStrategy:
                 # Use bid for exit checks when in trade
                 await self.update(asset, bbo.bid_price if trade else mid_price)
 
+                # Periodic dust cleanup when not in trade (every ~5 minutes)
+                if not self.active_trades[asset]:
+                    dust_check_counter += 1
+                    if dust_check_counter >= 30:  # 30 * 10s = 5 minutes
+                        await self._cleanup_dust_positions(asset, mid_price)
+                        dust_check_counter = 0
+
                 # Fast checks when in trade, slower for entries
                 if self.active_trades[asset]:
                     await asyncio.sleep(1)
@@ -572,6 +688,38 @@ class RSIBBStrategy:
 
         tasks = [self.run_asset(asset) for asset in self.clients.keys()]
         await asyncio.gather(*tasks)
+
+    async def _cleanup_dust_positions(self, asset: str, current_price: float):
+        """Clean up any tiny residual positions (dust) that shouldn't exist."""
+        if self.active_trades[asset] is not None:
+            return  # Don't interfere with active trades
+
+        if self.halted.get(asset, False):
+            return  # Don't clean up if halted
+
+        try:
+            client = self.clients[asset]
+            positions = await client.get_positions()
+
+            for pos in positions:
+                notional = pos.size * current_price
+                # Clean up positions worth less than $50
+                if notional < 50 and notional > 0:
+                    logger.info(f"{asset}: Cleaning up dust position: {pos.size:.6f} {pos.side} (${notional:.2f})")
+                    from exchange.base import OrderSide, OrderType
+                    close_side = OrderSide.SELL if pos.side == "LONG" else OrderSide.BUY
+                    try:
+                        await client.place_order(
+                            side=close_side,
+                            size=pos.size,
+                            order_type=OrderType.MARKET,
+                        )
+                        logger.info(f"{asset}: Dust position closed")
+                    except Exception as e:
+                        logger.warning(f"{asset}: Failed to close dust: {e}")
+
+        except Exception as e:
+            logger.warning(f"{asset}: Error checking for dust: {e}")
 
     async def _check_existing_positions(self):
         """Check for existing positions on exchange and populate active_trades."""

@@ -204,6 +204,7 @@ class LighterClient(ExchangeClient):
         order_type: 'OrderType' = None,
         max_attempts: int = 5,
         verify_timeout: float = 5.0,
+        closing_side: str = None,  # "SHORT" if closing a short, "LONG" if closing a long
     ) -> 'Order':
         """
         Place an order and retry with increasing slippage until it fills.
@@ -217,6 +218,7 @@ class LighterClient(ExchangeClient):
             order_type: Order type (defaults to MARKET)
             max_attempts: Maximum number of attempts
             verify_timeout: Seconds to wait for fill verification
+            closing_side: "SHORT" if closing a short, "LONG" if closing a long, None if opening
 
         Returns:
             Order object if successful
@@ -229,11 +231,39 @@ class LighterClient(ExchangeClient):
             order_type = OrderType.MARKET
 
         last_error = None
+        last_order = None
         # Slippage ramp for exits: 0.2% -> 0.5% -> 1% -> 1.5% -> 2%
         slippage_schedule = [0.2, 0.5, 1.0, 1.5, 2.0]
 
         for attempt in range(max_attempts):
             slippage = slippage_schedule[min(attempt, len(slippage_schedule) - 1)]
+
+            # CRITICAL: Before retry, check if position still needs closing
+            if attempt > 0 and closing_side is not None:
+                try:
+                    current_positions = await self.get_positions()
+                    has_target_position = False
+                    has_opposite_position = False
+                    opposite_side = "LONG" if closing_side == "SHORT" else "SHORT"
+
+                    for pos in current_positions:
+                        if pos.side == closing_side and pos.size > 0.0001:
+                            has_target_position = True
+                        elif pos.side == opposite_side and pos.size > 0.0001:
+                            has_opposite_position = True
+
+                    if has_opposite_position:
+                        logger.warning(f"Lighter: Position FLIPPED to {opposite_side} - {closing_side} is closed, aborting retries")
+                        return last_order  # Don't send more orders
+
+                    if not has_target_position:
+                        logger.info(f"Lighter: No {closing_side} position remains - aborting retries")
+                        return last_order  # Position already closed
+
+                except Exception as e:
+                    logger.warning(f"Lighter: Could not check position before retry: {e}")
+                    # Continue with retry if we can't check
+
             try:
                 # Place order with explicit slippage for exits
                 logger.info(f"Exit attempt {attempt + 1}/{max_attempts} with {slippage}% slippage")
@@ -243,10 +273,11 @@ class LighterClient(ExchangeClient):
                     order_type=order_type,
                     slippage_pct=slippage,  # Aggressive slippage for exits
                 )
+                last_order = order
 
                 # Verify the order filled
                 if not self.paper_mode:
-                    filled = await self.verify_order_filled(side, size, timeout_seconds=verify_timeout)
+                    filled = await self.verify_order_filled(side, size, timeout_seconds=verify_timeout, closing_side=closing_side)
                     if filled:
                         logger.info(f"Lighter: Order confirmed filled after {attempt + 1} attempt(s)")
                         return order
@@ -268,12 +299,18 @@ class LighterClient(ExchangeClient):
         logger.error(f"Lighter: {error_msg}")
         raise ValueError(error_msg)
 
-    async def verify_order_filled(self, side: 'OrderSide', expected_size: float, timeout_seconds: float = 10.0) -> bool:
+    async def verify_order_filled(self, side: 'OrderSide', expected_size: float, timeout_seconds: float = 10.0, closing_side: str = None) -> bool:
         """
         Verify an order was filled by checking position changes.
 
         For closing positions (BUY to close short, SELL to close long),
         we verify the position size decreased or was eliminated.
+
+        Args:
+            side: Order side (BUY or SELL)
+            expected_size: Expected order size
+            timeout_seconds: How long to wait for verification
+            closing_side: "SHORT" if closing a short, "LONG" if closing a long, None if opening
 
         Returns True if order appears to have filled, False otherwise.
         """
@@ -284,6 +321,9 @@ class LighterClient(ExchangeClient):
             import time
             start_time = time.time()
             check_interval = 0.5
+            opposite_side = None
+            if closing_side:
+                opposite_side = "LONG" if closing_side == "SHORT" else "SHORT"
 
             while time.time() - start_time < timeout_seconds:
                 positions = await self.get_positions()
@@ -293,12 +333,28 @@ class LighterClient(ExchangeClient):
                     logger.info(f"Lighter: Order verified - no open position")
                     return True
 
-                # Check if position size matches expected reduction
+                # Check position state
                 for pos in positions:
                     if pos.market == self.market:
-                        # Position still exists - check if it was reduced
                         logger.info(f"Lighter: Position check - size={pos.size}, side={pos.side}")
-                        # For now, if position exists we continue waiting
+
+                        # CRITICAL: Side-aware verification
+                        if closing_side is not None:
+                            # If position FLIPPED to opposite side, the close order worked
+                            # (and possibly overfilled, creating opposite position)
+                            if pos.side == opposite_side:
+                                logger.warning(f"Lighter: Position flipped from {closing_side} to {opposite_side} - close order filled (with flip)")
+                                return True  # Don't retry - would make opposite position bigger
+
+                            # If position is still the side we're closing but very small, consider it closed
+                            if pos.side == closing_side and pos.size < expected_size * 0.1:
+                                logger.info(f"Lighter: Position reduced to dust ({pos.size}) - considering closed")
+                                return True
+
+                            # If still same side with significant size, keep waiting
+                            if pos.side == closing_side:
+                                # Position still exists on same side, continue waiting
+                                pass
                         break
 
                 await asyncio.sleep(check_interval)

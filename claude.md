@@ -461,6 +461,91 @@ btc-momentum-bot/
 
 - **STATUS: LIVE TESTING - ALL BUGS FIXED**
 
+### 2026-01-19 (Session 11 - Critical Position Flip Bug Fix)
+
+- **CRITICAL BUG DISCOVERED: Exit Retry Loop Creating Opposite Positions**
+
+  **Root Cause Analysis:**
+  - When closing a SHORT via BUY order, verification only checked "does position exist?"
+  - If first BUY closed SHORT and created tiny LONG (dust/overfill), verification saw position exists
+  - Verification timed out, assumed order didn't fill, triggered retry
+  - Each retry BUY added to the LONG position
+  - Result: 4x position accumulation ($8,000+ LONG instead of flat)
+
+  **Timeline from Lighter trade data (2026-01-19 UTC):**
+  ```
+  20:31:52 - Close Short: 0.02148 BTC (SHORT closed)
+  20:31:55 - Open Long: 0.02148 BTC (retry created LONG - 3 sec later!)
+  21:12:45 - Open Long: 0.02147 BTC (another retry)
+  21:12:52 - Open Long: 0.02147 BTC (another retry)
+  21:12:58 - Open Long: 0.02147 BTC (another retry)
+  21:13:05 - Open Long: 0.02147 BTC (another retry)
+  Result: 0.089 BTC LONG (~$8,200 position, 4x expected)
+  ```
+
+  **Loss incurred:** ~$58.81 when manually closed
+
+- **FIXES IMPLEMENTED:**
+
+  1. **Side-Aware Verification** (`lighter_client.py`):
+     - `verify_order_filled()` now accepts `closing_side` parameter
+     - Detects position FLIP (SHORT→LONG) and returns success (don't retry)
+     - Logic: "If I was closing a SHORT and now see a LONG, the SHORT is closed"
+
+  2. **Pre-Retry Position Check** (`lighter_client.py`):
+     - Before each retry in `place_order_until_filled()`, checks current position
+     - If position flipped to opposite side → abort retries
+     - If no position of target side exists → abort retries
+     - Prevents accumulating opposite position
+
+  3. **Always Use Exchange Size** (`rsi_bb_strategy.py`):
+     - `exit_short()` now fetches actual position from exchange before exit
+     - Uses exchange size, not tracked size, to prevent dust
+     - If found LONG instead of SHORT → abort, clear tracked trade, don't send BUY
+
+  4. **Max Position Safeguard** (`rsi_bb_strategy.py`):
+     - New `_check_position_sanity()` method
+     - If position exceeds 2x expected size → HALT trading for that asset
+     - Logs emergency alert with position details
+     - Requires manual intervention (Option C: Alert + Manual Mode)
+
+  5. **Pre-Entry Position Check** (`rsi_bb_strategy.py`):
+     - Before entering SHORT, checks if any position already exists
+     - Prevents entering SHORT when LONG exists (would increase LONG via SELL)
+
+  6. **Dust Cleanup** (`rsi_bb_strategy.py`):
+     - New `_cleanup_dust_positions()` method
+     - Periodically cleans up positions < $50 notional
+     - Runs every ~5 minutes when not in a trade
+
+  7. **Halt Mechanism** (`rsi_bb_strategy.py`):
+     - New `halted` dict tracks halted assets
+     - When halted: no entries, no exits, logs warning
+     - Requires manual review and bot restart
+
+- **Files Modified:**
+  - `exchange/lighter_client.py`:
+    - `place_order_until_filled()` - Added `closing_side` param, pre-retry checks
+    - `verify_order_filled()` - Added side-aware verification logic
+  - `strategy/rsi_bb_strategy.py`:
+    - `exit_short()` - Always use exchange size, position reconciliation
+    - `enter_short()` - Pre-entry position check
+    - `update()` - Position sanity check, halted check
+    - `run_asset()` - Halted check, dust cleanup
+    - Added: `_check_position_sanity()`, `_cleanup_dust_positions()`, `halted` dict
+
+- **Safeguards Summary:**
+  | Safeguard | Location | Trigger | Action |
+  |-----------|----------|---------|--------|
+  | Side-aware verify | lighter_client | Position flips | Stop retries |
+  | Pre-retry check | lighter_client | Before each retry | Abort if wrong side |
+  | Exchange size | rsi_bb_strategy | Before exit | Use actual size |
+  | Max position | rsi_bb_strategy | Size > 2x expected | HALT + alert |
+  | Pre-entry check | rsi_bb_strategy | Before entry | Skip if position exists |
+  | Dust cleanup | rsi_bb_strategy | Every 5 min | Close < $50 positions |
+
+- **STATUS: FIXES IMPLEMENTED - Ready for testing**
+
 ### Remaining Work for Live Deployment
 1. ~~Integrate perp-dex-toolkit for Paradex/Lighter API~~ **DONE**
 2. ~~Implement real-time price feed~~ **DONE**
