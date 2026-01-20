@@ -5,6 +5,6 @@ Supports Paradex (primary) and Lighter (secondary) exchanges.
 
 from .base import ExchangeClient
 from .paradex_client import ParadexClient
-from .lighter_client import LighterClient
+from .lighter_client import LighterClient, NetworkError
 
-__all__ = ['ExchangeClient', 'ParadexClient', 'LighterClient']
+__all__ = ['ExchangeClient', 'ParadexClient', 'LighterClient', 'NetworkError']

@@ -9,9 +9,10 @@ Trade-off: 200-300ms latency (acceptable for 1-minute candle strategies).
 import os
 import asyncio
 import logging
-from typing import Optional, List, Callable
+from typing import Optional, List, Callable, TypeVar, Coroutine, Any
 from decimal import Decimal
 import time
+import inspect
 
 from .base import (
     ExchangeClient, Order, Position, Balance, Candle, BBO,
@@ -19,6 +20,110 @@ from .base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Network timeout configuration
+DEFAULT_TIMEOUT = 15.0  # Default timeout for API calls (seconds)
+ORDER_TIMEOUT = 30.0  # Longer timeout for order operations
+MAX_RETRIES = 3  # Max retries for transient failures
+RETRY_BASE_DELAY = 1.0  # Base delay for exponential backoff
+
+T = TypeVar('T')
+
+
+class NetworkError(Exception):
+    """Raised when a network operation fails after all retries."""
+    pass
+
+
+async def _run_with_timeout(coro_or_func, timeout: float, *args, **kwargs) -> Any:
+    """
+    Run a coroutine or sync function with a timeout.
+
+    Args:
+        coro_or_func: Coroutine or callable to execute
+        timeout: Timeout in seconds
+        *args, **kwargs: Arguments to pass if coro_or_func is callable
+
+    Returns:
+        Result of the operation
+
+    Raises:
+        asyncio.TimeoutError if timeout exceeded
+    """
+    if inspect.iscoroutine(coro_or_func):
+        # Already a coroutine
+        return await asyncio.wait_for(coro_or_func, timeout=timeout)
+    elif inspect.iscoroutinefunction(coro_or_func):
+        # Coroutine function - call it
+        return await asyncio.wait_for(coro_or_func(*args, **kwargs), timeout=timeout)
+    else:
+        # Sync function - run in thread pool with timeout
+        loop = asyncio.get_event_loop()
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: coro_or_func(*args, **kwargs)),
+            timeout=timeout
+        )
+
+
+async def api_call_with_retry(
+    operation_name: str,
+    operation: Callable,
+    timeout: float = DEFAULT_TIMEOUT,
+    max_retries: int = MAX_RETRIES,
+    *args, **kwargs
+) -> Any:
+    """
+    Execute an API call with timeout and retry logic.
+
+    Args:
+        operation_name: Name for logging
+        operation: The API method to call
+        timeout: Timeout per attempt in seconds
+        max_retries: Maximum number of retry attempts
+        *args, **kwargs: Arguments for the operation
+
+    Returns:
+        Result of the operation
+
+    Raises:
+        NetworkError if all retries fail
+    """
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            result = await _run_with_timeout(operation, timeout, *args, **kwargs)
+            return result
+
+        except asyncio.TimeoutError:
+            last_error = f"Timeout after {timeout}s"
+            logger.warning(f"{operation_name}: {last_error} (attempt {attempt + 1}/{max_retries})")
+
+        except asyncio.CancelledError:
+            # Don't retry on cancellation
+            raise
+
+        except Exception as e:
+            error_str = str(e).lower()
+            # Check for transient errors that should be retried
+            transient_indicators = ['timeout', 'connection', 'network', 'temporary', 'unavailable', '503', '502', '504']
+            is_transient = any(ind in error_str for ind in transient_indicators)
+
+            if is_transient:
+                last_error = str(e)
+                logger.warning(f"{operation_name}: Transient error: {e} (attempt {attempt + 1}/{max_retries})")
+            else:
+                # Non-transient error - don't retry
+                raise
+
+        # Exponential backoff before retry
+        if attempt < max_retries - 1:
+            delay = RETRY_BASE_DELAY * (2 ** attempt)
+            logger.debug(f"{operation_name}: Retrying in {delay}s...")
+            await asyncio.sleep(delay)
+
+    # All retries exhausted
+    raise NetworkError(f"{operation_name} failed after {max_retries} attempts. Last error: {last_error}")
 
 # Global nonce lock shared across ALL LighterClient instances
 # This prevents nonce collisions when multiple clients (BTC, ETH, SOL)
@@ -154,8 +259,14 @@ class LighterClient(ExchangeClient):
             force_refresh: If True, always fetch fresh nonce from server
         """
         try:
-            # Fetch account info to get current nonce state
-            account = await self.account_api.account(by='index', value=str(self.account_index))
+            # Fetch account info to get current nonce state (with timeout)
+            account = await api_call_with_retry(
+                f"sync_nonces({self.market})",
+                self.account_api.account,
+                timeout=DEFAULT_TIMEOUT,
+                max_retries=2,  # Fewer retries for nonce sync
+                by='index', value=str(self.account_index)
+            )
             if hasattr(account, 'accounts') and account.accounts:
                 acc = account.accounts[0]
 
@@ -173,19 +284,19 @@ class LighterClient(ExchangeClient):
                 if nonce is not None:
                     if hasattr(self.signer_client, 'set_nonce'):
                         self.signer_client.set_nonce(int(nonce))
-                        logger.info(f"Lighter: Set signer nonce via set_nonce() to {nonce}")
+                        logger.debug(f"Lighter: Set signer nonce via set_nonce() to {nonce}")
                     elif hasattr(self.signer_client, '_nonce'):
                         self.signer_client._nonce = int(nonce)
-                        logger.info(f"Lighter: Set signer _nonce to {nonce}")
+                        logger.debug(f"Lighter: Set signer _nonce to {nonce}")
                     elif hasattr(self.signer_client, 'nonce'):
                         self.signer_client.nonce = int(nonce)
-                        logger.info(f"Lighter: Set signer nonce to {nonce}")
+                        logger.debug(f"Lighter: Set signer nonce to {nonce}")
                     else:
                         logger.warning(f"Lighter: Could not find way to set nonce on signer_client")
+        except NetworkError as e:
+            logger.warning(f"Lighter: Nonce sync failed (network): {e}")
         except Exception as e:
             logger.warning(f"Lighter: Could not sync nonce: {e}")
-            import traceback
-            traceback.print_exc()
 
     async def place_order_until_filled(
         self,
@@ -195,6 +306,7 @@ class LighterClient(ExchangeClient):
         max_attempts: int = 5,
         verify_timeout: float = 5.0,
         closing_side: str = None,  # "SHORT" if closing a short, "LONG" if closing a long
+        max_network_retries: int = 3,  # Separate counter for network errors
     ) -> 'Order':
         """
         Place an order and retry with increasing slippage until it fills.
@@ -202,19 +314,23 @@ class LighterClient(ExchangeClient):
         This is critical for exit orders that MUST fill to close positions.
         Uses slippage ramp: 0.2% -> 0.5% -> 1% -> 1.5% -> 2%.
 
+        Network errors are retried separately from slippage-based retries.
+
         Args:
             side: BUY or SELL
             size: Order size
             order_type: Order type (defaults to MARKET)
-            max_attempts: Maximum number of attempts
+            max_attempts: Maximum number of attempts for slippage ramp
             verify_timeout: Seconds to wait for fill verification
             closing_side: "SHORT" if closing a short, "LONG" if closing a long, None if opening
+            max_network_retries: Max retries for network errors per slippage attempt
 
         Returns:
             Order object if successful
 
         Raises:
             ValueError if order fails after all attempts
+            NetworkError if network errors persist
         """
         if order_type is None:
             from .base import OrderType
@@ -250,39 +366,56 @@ class LighterClient(ExchangeClient):
                         logger.info(f"Lighter: No {closing_side} position remains - aborting retries")
                         return last_order  # Position already closed
 
+                except NetworkError as e:
+                    logger.warning(f"Lighter: Network error checking position: {e}")
+                    # Still try to place the order
                 except Exception as e:
                     logger.warning(f"Lighter: Could not check position before retry: {e}")
                     # Continue with retry if we can't check
 
-            try:
-                # Place order with explicit slippage for exits
-                logger.info(f"Exit attempt {attempt + 1}/{max_attempts} with {slippage}% slippage")
-                order = await self.place_order(
-                    side=side,
-                    size=size,
-                    order_type=order_type,
-                    slippage_pct=slippage,  # Aggressive slippage for exits
-                )
-                last_order = order
+            # Network retry loop for this slippage attempt
+            for network_retry in range(max_network_retries):
+                try:
+                    # Place order with explicit slippage for exits
+                    logger.info(f"Exit attempt {attempt + 1}/{max_attempts} with {slippage}% slippage" +
+                               (f" (network retry {network_retry + 1})" if network_retry > 0 else ""))
+                    order = await self.place_order(
+                        side=side,
+                        size=size,
+                        order_type=order_type,
+                        slippage_pct=slippage,  # Aggressive slippage for exits
+                    )
+                    last_order = order
 
-                # Verify the order filled
-                if not self.paper_mode:
-                    filled = await self.verify_order_filled(side, size, timeout_seconds=verify_timeout, closing_side=closing_side)
-                    if filled:
-                        logger.info(f"Lighter: Order confirmed filled after {attempt + 1} attempt(s)")
-                        return order
+                    # Verify the order filled
+                    if not self.paper_mode:
+                        filled = await self.verify_order_filled(side, size, timeout_seconds=verify_timeout, closing_side=closing_side)
+                        if filled:
+                            logger.info(f"Lighter: Order confirmed filled after {attempt + 1} attempt(s)")
+                            return order
+                        else:
+                            # Order placed but not filled - try again with more slippage
+                            logger.warning(f"Lighter: Order not filled, retrying with more slippage (attempt {attempt + 1}/{max_attempts})")
+                            break  # Break network retry loop, continue to next slippage
                     else:
-                        # Order placed but not filled - try again with more slippage
-                        logger.warning(f"Lighter: Order not filled, retrying with more slippage (attempt {attempt + 1}/{max_attempts})")
-                        continue
-                else:
-                    return order
+                        return order
 
-            except Exception as e:
-                last_error = e
-                logger.warning(f"Lighter: Order attempt {attempt + 1}/{max_attempts} failed: {e}")
-                await asyncio.sleep(0.5)
-                continue
+                except NetworkError as e:
+                    last_error = e
+                    if network_retry < max_network_retries - 1:
+                        delay = RETRY_BASE_DELAY * (2 ** network_retry)
+                        logger.warning(f"Lighter: Network error on order attempt, retrying in {delay}s: {e}")
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        logger.error(f"Lighter: Network errors persisted after {max_network_retries} retries")
+                        raise  # Re-raise NetworkError if all network retries exhausted
+
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"Lighter: Order attempt {attempt + 1}/{max_attempts} failed: {e}")
+                    await asyncio.sleep(0.5)
+                    break  # Break network retry loop, continue to next slippage
 
         # All attempts failed
         error_msg = f"Order failed after {max_attempts} attempts. Last error: {last_error}"
@@ -376,7 +509,12 @@ class LighterClient(ExchangeClient):
     async def _fetch_orderbook_mapping(self):
         """Fetch orderbook IDs for markets."""
         try:
-            orderbooks = await self.order_api.order_books()
+            orderbooks = await api_call_with_retry(
+                f"fetch_orderbook_mapping({self.market})",
+                self.order_api.order_books,
+                timeout=DEFAULT_TIMEOUT,
+                max_retries=MAX_RETRIES
+            )
             for ob in orderbooks.order_books:
                 if ob.market_type == 'perp':
                     # Map symbol to market_id (e.g., "BTC" -> 1)
@@ -395,6 +533,9 @@ class LighterClient(ExchangeClient):
                 logger.info(f"Lighter: Using market_id {self._orderbook_id} for {symbol}")
             else:
                 logger.warning(f"Lighter: Market {self.market} not found. Available: BTC, ETH, SOL, etc.")
+        except NetworkError as e:
+            logger.error(f"Network error fetching orderbook mapping: {e}")
+            raise
         except Exception as e:
             logger.error(f"Error fetching orderbook mapping: {e}")
             import traceback
@@ -408,7 +549,7 @@ class LighterClient(ExchangeClient):
         logger.info(f"Lighter: Disconnected {self.market}")
 
     async def get_bbo(self) -> BBO:
-        """Get best bid/offer."""
+        """Get best bid/offer with retry logic."""
         if self.paper_mode:
             if self._last_bbo:
                 return self._last_bbo
@@ -424,18 +565,14 @@ class LighterClient(ExchangeClient):
             if self._orderbook_id is None:
                 raise ValueError(f"No orderbook ID for market {self.market}")
 
-            # Get top of book from order_book_orders with timeout
+            # Get top of book from order_book_orders with timeout and retry
             logger.debug(f"Fetching BBO for market_id={self._orderbook_id}...")
-            try:
-                # Run the API call with a timeout
-                # The SDK may use async or sync - handle both cases
-                orders = await asyncio.wait_for(
-                    self._fetch_order_book_orders(),
-                    timeout=10.0
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"BBO fetch timed out for market {self.market}")
-                raise ValueError(f"BBO fetch timed out for market {self.market}")
+            orders = await api_call_with_retry(
+                f"get_bbo({self.market})",
+                self._fetch_order_book_orders,
+                timeout=DEFAULT_TIMEOUT,
+                max_retries=MAX_RETRIES
+            )
 
             bid_price = 0
             bid_size = 0
@@ -457,6 +594,9 @@ class LighterClient(ExchangeClient):
                 ask_size=ask_size,
                 timestamp=int(time.time() * 1000)
             )
+        except NetworkError as e:
+            logger.error(f"Network error fetching BBO: {e}")
+            raise
         except Exception as e:
             logger.error(f"Error fetching BBO: {e}")
             raise
@@ -553,7 +693,13 @@ class LighterClient(ExchangeClient):
             )
 
         try:
-            account = await self.account_api.account(by='index', value=str(self.account_index))
+            account = await api_call_with_retry(
+                f"get_balance({self.market})",
+                self.account_api.account,
+                timeout=DEFAULT_TIMEOUT,
+                max_retries=MAX_RETRIES,
+                by='index', value=str(self.account_index)
+            )
             # Account info is in accounts list
             if hasattr(account, 'accounts') and account.accounts:
                 acc = account.accounts[0]
@@ -566,6 +712,9 @@ class LighterClient(ExchangeClient):
                     in_orders=0
                 )
             return Balance(currency="USDC", available=0, total=0, in_orders=0)
+        except NetworkError as e:
+            logger.error(f"Network error fetching balance: {e}")
+            raise
         except Exception as e:
             logger.error(f"Error fetching balance: {e}")
             raise
@@ -578,7 +727,13 @@ class LighterClient(ExchangeClient):
             return []
 
         try:
-            account = await self.account_api.account(by='index', value=str(self.account_index))
+            account = await api_call_with_retry(
+                f"get_positions({self.market})",
+                self.account_api.account,
+                timeout=DEFAULT_TIMEOUT,
+                max_retries=MAX_RETRIES,
+                by='index', value=str(self.account_index)
+            )
             positions = []
 
             # Positions are in accounts list
@@ -666,6 +821,9 @@ class LighterClient(ExchangeClient):
                             ))
 
             return positions
+        except NetworkError as e:
+            logger.error(f"Network error fetching positions: {e}")
+            raise
         except Exception as e:
             logger.error(f"Error fetching positions: {e}")
             raise
@@ -833,13 +991,20 @@ class LighterClient(ExchangeClient):
                     # Use create_market_order for market orders
                     # Parameters: market_index, client_order_index, base_amount, avg_execution_price, is_ask
                     logger.debug(f"Placing market order: market={self._orderbook_id}, size={size_int}, bbo_price={current_price:.2f}, max_price={price_with_slippage:.2f} ({slippage_tolerance*100:.1f}% slippage), is_ask={is_ask}")
-                    result = await self.signer_client.create_market_order(
-                        market_index=self._orderbook_id,
-                        client_order_index=client_order_idx,
-                        base_amount=size_int,
-                        avg_execution_price=price_int,
-                        is_ask=is_ask
-                    )
+                    try:
+                        result = await asyncio.wait_for(
+                            self.signer_client.create_market_order(
+                                market_index=self._orderbook_id,
+                                client_order_index=client_order_idx,
+                                base_amount=size_int,
+                                avg_execution_price=price_int,
+                                is_ask=is_ask
+                            ),
+                            timeout=ORDER_TIMEOUT
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f"Order placement timed out after {ORDER_TIMEOUT}s")
+                        raise NetworkError(f"Order placement timed out after {ORDER_TIMEOUT}s")
                     # Result is tuple: (tx, response, error)
                     tx, response, error = result
 
@@ -872,15 +1037,22 @@ class LighterClient(ExchangeClient):
 
                     limit_price_int = int(price * (10 ** price_decimals))
                     logger.debug(f"Placing limit order: market={self._orderbook_id}, size={size_int}, price={limit_price_int}, is_ask={is_ask}")
-                    result = await self.signer_client.create_order(
-                        market_index=self._orderbook_id,
-                        client_order_index=client_order_idx,
-                        base_amount=size_int,
-                        price=limit_price_int,
-                        is_ask=is_ask,
-                        order_type=self.signer_client.ORDER_TYPE_LIMIT,
-                        time_in_force=self.signer_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
-                    )
+                    try:
+                        result = await asyncio.wait_for(
+                            self.signer_client.create_order(
+                                market_index=self._orderbook_id,
+                                client_order_index=client_order_idx,
+                                base_amount=size_int,
+                                price=limit_price_int,
+                                is_ask=is_ask,
+                                order_type=self.signer_client.ORDER_TYPE_LIMIT,
+                                time_in_force=self.signer_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
+                            ),
+                            timeout=ORDER_TIMEOUT
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f"Limit order placement timed out after {ORDER_TIMEOUT}s")
+                        raise NetworkError(f"Limit order placement timed out after {ORDER_TIMEOUT}s")
                     # Result is tuple: (tx, response, error)
                     tx, response, error = result
 
@@ -919,6 +1091,9 @@ class LighterClient(ExchangeClient):
             except ValueError:
                 # Re-raise ValueError (our own errors) without wrapping
                 raise
+            except NetworkError:
+                # Re-raise NetworkError (timeout/connection issues) without wrapping
+                raise
             except Exception as e:
                 error_str = str(e)
                 # Check for invalid nonce error in unexpected exceptions too
@@ -928,6 +1103,11 @@ class LighterClient(ExchangeClient):
                     await asyncio.sleep(retry_delay)
                     await self._sync_nonces(force_refresh=True)
                     return await self.place_order(side, size, order_type, price, client_id, _retry_count + 1)
+                # Check for network-like errors and wrap as NetworkError
+                network_indicators = ['timeout', 'connection', 'network', 'unavailable']
+                if any(ind in error_str.lower() for ind in network_indicators):
+                    logger.error(f"Network error placing order: {e}")
+                    raise NetworkError(f"Network error: {e}")
                 logger.error(f"Error placing order: {e}")
                 raise
 

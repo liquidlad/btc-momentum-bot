@@ -26,7 +26,14 @@ from dataclasses import dataclass
 from collections import deque
 import numpy as np
 
+from exchange.lighter_client import NetworkError
+
 logger = logging.getLogger(__name__)
+
+# Network error handling
+MAX_CONSECUTIVE_NETWORK_ERRORS = 10  # Max before giving up
+NETWORK_ERROR_BACKOFF_BASE = 2.0  # Base seconds for exponential backoff
+NETWORK_ERROR_BACKOFF_MAX = 60.0  # Max backoff seconds
 
 # Trade history CSV path
 TRADE_HISTORY_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
@@ -678,6 +685,7 @@ class RSIBBStrategy:
         log_counter = 0
         first_bbo = True
         dust_check_counter = 0
+        consecutive_network_errors = 0
 
         while self.running:
             # Check if halted
@@ -688,6 +696,11 @@ class RSIBBStrategy:
             try:
                 bbo = await client.get_bbo()
                 mid_price = (bbo.bid_price + bbo.ask_price) / 2
+
+                # Reset network error counter on successful operation
+                if consecutive_network_errors > 0:
+                    logger.info(f"{asset}: Network connection restored after {consecutive_network_errors} errors")
+                    consecutive_network_errors = 0
 
                 if first_bbo:
                     logger.info(f"{asset}: First BBO received - Bid: {bbo.bid_price:.2f}, Ask: {bbo.ask_price:.2f}")
@@ -749,6 +762,33 @@ class RSIBBStrategy:
                     await asyncio.sleep(1)
                 else:
                     await asyncio.sleep(10)
+
+            except NetworkError as e:
+                consecutive_network_errors += 1
+
+                if consecutive_network_errors >= MAX_CONSECUTIVE_NETWORK_ERRORS:
+                    logger.error(f"{asset}: CRITICAL - {consecutive_network_errors} consecutive network errors, halting trading")
+                    self.halted[asset] = True
+                    continue
+
+                # Calculate backoff with exponential increase, capped at max
+                backoff = min(NETWORK_ERROR_BACKOFF_BASE * (2 ** (consecutive_network_errors - 1)), NETWORK_ERROR_BACKOFF_MAX)
+                logger.warning(f"{asset}: Network error ({consecutive_network_errors}/{MAX_CONSECUTIVE_NETWORK_ERRORS}), retrying in {backoff:.1f}s: {e}")
+
+                # Attempt reconnection if many errors
+                if consecutive_network_errors >= 3 and not client.paper_mode:
+                    logger.info(f"{asset}: Attempting reconnection...")
+                    try:
+                        await client.disconnect()
+                        await asyncio.sleep(1)
+                        if await client.connect():
+                            logger.info(f"{asset}: Reconnected successfully")
+                        else:
+                            logger.warning(f"{asset}: Reconnection failed")
+                    except Exception as reconnect_err:
+                        logger.warning(f"{asset}: Reconnection attempt failed: {reconnect_err}")
+
+                await asyncio.sleep(backoff)
 
             except Exception as e:
                 logger.error(f"{asset}: Error in strategy loop: {e}")

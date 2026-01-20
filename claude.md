@@ -591,6 +591,80 @@ btc-momentum-bot/
 
 - **STATUS: LIVE AND WORKING**
 
+### 2026-01-20 (Session 13 - Network Timeout & Reconnection Fix)
+
+- **CRITICAL BUG FIXED: Network Hang During Exit**
+
+  **Root Cause:**
+  - Bot hung for 7.5 hours (23:40 to 07:09) during an exit attempt
+  - Network call (`create_market_order`) had no timeout
+  - When connection dropped, await hung forever
+  - Bot was completely frozen, couldn't monitor or close position
+
+  **Symptoms from logs:**
+  ```
+  2026-01-19 23:40:32 Exit attempt 1/5 with 0.2% slippage
+  [... nothing for 7.5 hours ...]
+  2026-01-20 07:09:07 Keyboard interrupt received
+  ```
+
+- **FIXES IMPLEMENTED:**
+
+  1. **Timeout Helper Function** (`lighter_client.py`):
+     - New `api_call_with_retry()` function wraps SDK calls
+     - Configurable timeout (default 15s, orders 30s)
+     - Automatic retry with exponential backoff
+     - Catches both sync and async SDK methods
+     - New `NetworkError` exception class for timeout/connection errors
+
+  2. **Timeouts Added to All API Calls**:
+     - `get_bbo()` - 15s timeout with 3 retries
+     - `get_positions()` - 15s timeout with 3 retries
+     - `get_balance()` - 15s timeout with 3 retries
+     - `place_order()` - 30s timeout for order placement
+     - `_sync_nonces()` - 15s timeout with 2 retries
+     - `_fetch_orderbook_mapping()` - 15s timeout with 3 retries
+
+  3. **Network Error Handling in place_order_until_filled()**:
+     - Separate network retry counter (doesn't consume slippage attempts)
+     - Network errors retry 3 times per slippage level
+     - Exponential backoff: 1s → 2s → 4s
+     - Raises `NetworkError` after all retries exhausted
+
+  4. **Strategy-Level Network Handling** (`rsi_bb_strategy.py`):
+     - Catches `NetworkError` separately from general exceptions
+     - Tracks consecutive network errors per asset
+     - Exponential backoff: 2s → 4s → 8s → ... → 60s max
+     - After 3 consecutive errors: attempts reconnection
+     - After 10 consecutive errors: HALTS trading for that asset
+     - Logs connection restored when errors clear
+
+- **Timeout Configuration:**
+  | Operation | Timeout | Max Retries | Backoff |
+  |-----------|---------|-------------|---------|
+  | BBO fetch | 15s | 3 | 1s → 2s → 4s |
+  | Position fetch | 15s | 3 | 1s → 2s → 4s |
+  | Balance fetch | 15s | 3 | 1s → 2s → 4s |
+  | Order placement | 30s | 3 | 1s → 2s → 4s |
+  | Nonce sync | 15s | 2 | 1s → 2s |
+  | Strategy level | - | 10 | 2s → 60s max |
+
+- **Files Modified:**
+  - `exchange/lighter_client.py`:
+    - Added `NetworkError` class
+    - Added `api_call_with_retry()` helper
+    - Added `_run_with_timeout()` helper
+    - Updated all API methods to use timeouts
+    - Updated `place_order_until_filled()` with network retry loop
+  - `exchange/__init__.py`:
+    - Exported `NetworkError` class
+  - `strategy/rsi_bb_strategy.py`:
+    - Added `NetworkError` import
+    - Added network error handling constants
+    - Updated `run_asset()` with network error handling and reconnection
+
+- **STATUS: READY FOR TESTING**
+
 ### Remaining Work for Live Deployment
 1. ~~Integrate perp-dex-toolkit for Paradex/Lighter API~~ **DONE**
 2. ~~Implement real-time price feed~~ **DONE**
