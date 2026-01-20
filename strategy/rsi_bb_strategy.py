@@ -262,7 +262,10 @@ class RSIBBStrategy:
     async def _check_position_sanity(self, asset: str, current_price: float) -> bool:
         """
         Check if position size is within safe limits.
-        Returns False and halts if position exceeds 2x expected size.
+        If position exceeds 2x expected size:
+        1. Attempt ONE emergency close
+        2. Halt ALL assets (not just this one)
+        Returns False if halted.
         """
         if self.halted.get(asset, False):
             return False  # Already halted
@@ -282,9 +285,32 @@ class RSIBBStrategy:
                     logger.error(f"{asset}: Expected size: {expected_size:.6f}")
                     logger.error(f"{asset}: Current price: {current_price:.2f}")
                     logger.error(f"{asset}: Unrealized PnL: ${pos.unrealized_pnl:.2f}")
-                    logger.error(f"{asset}: ACTION REQUIRED - Close manually on Lighter or restart bot")
-                    logger.error(f"{asset}: === TRADING HALTED FOR THIS ASSET ===")
-                    self.halted[asset] = True
+
+                    # Attempt ONE emergency close
+                    logger.error(f"{asset}: Attempting emergency close of {pos.size:.6f} {pos.side}...")
+                    try:
+                        from exchange.base import OrderSide, OrderType
+                        close_side = OrderSide.SELL if pos.side == "LONG" else OrderSide.BUY
+                        await client.place_order(
+                            side=close_side,
+                            size=pos.size,
+                            order_type=OrderType.MARKET,
+                            slippage_pct=1.0,  # 1% slippage for emergency
+                        )
+                        logger.error(f"{asset}: Emergency close order sent")
+                    except Exception as close_err:
+                        logger.error(f"{asset}: Emergency close FAILED: {close_err}")
+
+                    # Halt ALL assets
+                    logger.error(f"=== HALTING ALL TRADING ===")
+                    for a in self.halted.keys():
+                        self.halted[a] = True
+
+                    # Clear all active trades to prevent further exit attempts
+                    for a in self.active_trades.keys():
+                        self.active_trades[a] = None
+
+                    logger.error(f"All assets halted. Review positions on Lighter and restart bot.")
                     return False
 
             return True
