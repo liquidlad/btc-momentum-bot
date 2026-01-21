@@ -665,6 +665,41 @@ btc-momentum-bot/
 
 - **STATUS: READY FOR TESTING**
 
+### 2026-01-20 (Session 14 - Rate Limit Fix)
+
+- **ISSUE: Lighter API Rate Limiting (429 Too Many Requests)**
+
+  **Root Cause:**
+  - Standard Lighter accounts have only **60 requests/minute** limit
+  - With 3 assets (BTC, ETH, SOL) polling every 1 second when in position
+  - Each loop calls `get_bbo()` + `get_positions()` = 6+ calls/sec = 360/min
+  - Far exceeds the 60/min limit
+
+  **Lighter Rate Limit Tiers:**
+  | Account Type | Requests/min |
+  |--------------|--------------|
+  | Standard | 60 |
+  | Premium | 24,000 |
+
+  Note: Premium accounts have 0.02% taker fees, Standard has 0% fees.
+  Rate limits tracked by BOTH IP address AND L1 wallet address.
+  Sub-accounts share limits (same L1 wallet).
+
+- **FIX IMPLEMENTED:**
+  - Increased polling interval from 1 second to 3 seconds when in active position
+  - Reduces API calls by 3x during active trades
+  - Should stay under 60 requests/min with 2-3 assets
+
+- **Files Modified:**
+  - `strategy/rsi_bb_strategy.py`:
+    - Changed `await asyncio.sleep(1)` to `await asyncio.sleep(3)` in position monitoring loop
+
+- **Recommendation:**
+  - Consider running only BTC+ETH (drop SOL which had negative PnL)
+  - Or upgrade to Premium account if higher request rate needed (but loses 0% fees)
+
+- **STATUS: DEPLOYED**
+
 ### Remaining Work for Live Deployment
 1. ~~Integrate perp-dex-toolkit for Paradex/Lighter API~~ **DONE**
 2. ~~Implement real-time price feed~~ **DONE**

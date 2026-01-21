@@ -759,7 +759,7 @@ class RSIBBStrategy:
 
                 # Fast checks when in trade, slower for entries
                 if self.active_trades[asset]:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(3)  # Reduced from 1s to avoid rate limits
                 else:
                     await asyncio.sleep(10)
 
