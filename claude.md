@@ -698,6 +698,44 @@ btc-momentum-bot/
   - Consider running only BTC+ETH (drop SOL which had negative PnL)
   - Or upgrade to Premium account if higher request rate needed (but loses 0% fees)
 
+- **FUTURE OPTIMIZATION: WebSocket Price Feed**
+
+  Currently each bot polls REST API for prices. Better approach:
+
+  **Architecture:**
+  ```
+  [WebSocket Client] ---> subscribes to BTC/ETH/SOL orderbooks
+          |
+          v
+     [Local Cache] (file or Redis)
+          |
+          v
+  [Bot 1] [Bot 2] [Bot 3] [Bot 4] ---> read prices from cache
+          |
+          v
+     [REST API] ---> only for orders & position checks
+  ```
+
+  **Lighter WebSocket Details:**
+  - URL: `wss://mainnet.zklighter.elliot.ai/stream`
+  - Orderbook updates pushed every 50ms
+  - Limits: 100 connections, 1000 subscriptions per IP
+  - Auto-disconnects after 24 hours (need reconnect logic)
+
+  **Benefits:**
+  - Zero REST API calls for price data
+  - Real-time 50ms updates (faster than polling)
+  - Scales to any number of bots
+  - Professional approach (REST for orders, WebSocket for market data)
+
+  **Rate Limit Notes:**
+  - Limits tracked by BOTH IP address AND L1 wallet address
+  - 4 wallets on 1 IP = still only 60 req/min (IP bottleneck)
+  - Need different wallets AND different IPs to multiply limits
+  - Sub-accounts share L1 wallet limits
+
+  **Status:** NOT IMPLEMENTED - Build when ready to scale to multiple bots
+
 - **STATUS: DEPLOYED**
 
 ### Remaining Work for Live Deployment
@@ -709,7 +747,8 @@ btc-momentum-bot/
 6. ~~Deploy with live capital~~ **DONE (Paradex)**
 7. ~~Discover Paradex API fees~~ **DONE (0.019% - kills profitability)**
 8. ~~Migrate to Lighter (0% fees)~~ **DONE**
-9. Set up Lighter credentials and deploy live
+9. ~~Set up Lighter credentials and deploy live~~ **DONE**
+10. (FUTURE) Implement WebSocket price feed to eliminate REST API rate limits
 
 ---
 
