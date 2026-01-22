@@ -738,7 +738,7 @@ class RSIBBStrategy:
                 else:
                     # Log status periodically when not in a trade
                     log_counter += 1
-                    if log_counter >= 4:  # Log every ~2 minutes (4 * 30s)
+                    if log_counter >= 2:  # Log every ~20s (2 × 10s)
                         prices = list(self.price_history[asset])
                         price_count = len(prices)
                         if price_count >= max(self.config.bb_period, self.config.rsi_period + 1):
