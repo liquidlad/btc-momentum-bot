@@ -755,7 +755,7 @@ class RSIBBStrategy:
 
                 if trade:
                     log_counter += 1
-                    if log_counter >= 12:  # Log every ~60s
+                    if log_counter >= 6:  # Log every ~18s (6 × 3s)
                         pnl_pct = (trade.entry_price - bid_price) / trade.entry_price * 100
                         pnl_usd = pnl_pct / 100 * self.config.margin_per_trade * self.config.leverage
                         trail_status = "ACTIVE" if trade.trailing_active else "inactive"
