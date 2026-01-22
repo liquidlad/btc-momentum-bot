@@ -1,8 +1,8 @@
 """
-RSI + Bollinger Band Strategy
+RSI + Bollinger Band Strategy with Trailing Stop
 
-Entry: SHORT when price > upper BB AND RSI > 75
-Exit: Lower BB OR max hold time (10 min) OR stop loss (0.3%)
+Entry: SHORT when price > upper BB AND RSI > threshold
+Exit: Trailing stop (0.2% after 0.1% profit) OR lower BB OR stop loss
 
 Optimized parameters from backtest:
 - BTC: RSI > 75, SL 0.3%, Trail 0.2%@0.1%
@@ -25,23 +25,8 @@ from typing import Optional, Dict
 from dataclasses import dataclass
 from collections import deque
 import numpy as np
-import sys
-
-from exchange.lighter_client import NetworkError
-
-# Add shared_prices to path for price_reader
-sys.path.insert(0, r"C:\Users\eliha\shared_prices")
-from price_reader import get_price, get_bbo, is_price_fresh
 
 logger = logging.getLogger(__name__)
-
-# Shared price config
-PRICE_MAX_AGE = 15  # seconds - skip trading if price older than this
-
-# Network error handling
-MAX_CONSECUTIVE_NETWORK_ERRORS = 10  # Max before giving up
-NETWORK_ERROR_BACKOFF_BASE = 2.0  # Base seconds for exponential backoff
-NETWORK_ERROR_BACKOFF_MAX = 60.0  # Max backoff seconds
 
 # Trade history CSV path
 TRADE_HISTORY_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
@@ -56,7 +41,8 @@ class RSIBBTrade:
     entry_price: float
     size: float
     stop_loss_price: float
-    best_price: float  # Lowest price seen (for tracking max profit)
+    best_price: float  # Lowest price seen (for trailing)
+    trailing_active: bool = False
 
 
 @dataclass
@@ -71,7 +57,8 @@ class RSIBBConfig:
 
     # Exit settings
     stop_loss_pct: float = 0.30
-    max_hold_seconds: int = 600  # 10 minutes max hold time
+    trailing_stop_pct: float = 0.20
+    trailing_activation_pct: float = 0.10  # Activate trailing after 0.1% profit
 
     # Position sizing
     margin_per_trade: float = 100.0
@@ -80,10 +67,10 @@ class RSIBBConfig:
 
 class RSIBBStrategy:
     """
-    RSI + Bollinger Band Strategy.
+    RSI + Bollinger Band Strategy with Trailing Stop.
 
-    Entry: SHORT when price > upper BB AND RSI > 75
-    Exit: Lower BB OR max hold time (10 min) OR stop loss (0.3%)
+    Entry: SHORT when price > upper BB AND RSI > threshold
+    Exit: Trailing stop OR lower BB OR stop loss
     """
 
     def __init__(
@@ -95,11 +82,11 @@ class RSIBBStrategy:
         self.clients = exchange_clients
         self.config = config or RSIBBConfig()
 
-        # Per-asset RSI entry thresholds (all set to 75 based on performance analysis)
+        # Per-asset RSI entry thresholds (optimized)
         self.rsi_entry = rsi_entry_overrides or {
             "BTC": 75,
-            "ETH": 75,
-            "SOL": 75,
+            "ETH": 60,
+            "SOL": 65,
         }
 
         # Price history for indicators
@@ -245,14 +232,23 @@ class RSIBBStrategy:
         if current_price < trade.best_price:
             trade.best_price = current_price
 
+        # Calculate current PnL
+        pnl_pct = (trade.entry_price - current_price) / trade.entry_price * 100
+
+        # Check if trailing should activate
+        if not trade.trailing_active and pnl_pct >= self.config.trailing_activation_pct:
+            trade.trailing_active = True
+            logger.info(f"{asset}: Trailing stop activated at {pnl_pct:.2f}% profit")
+
         # 1. Stop Loss
         if current_price >= trade.stop_loss_price:
             return "stop_loss"
 
-        # 2. Max hold time (10 minutes)
-        hold_seconds = (datetime.now() - trade.entry_time).total_seconds()
-        if hold_seconds >= self.config.max_hold_seconds:
-            return "max_hold_time"
+        # 2. Trailing Stop (if active)
+        if trade.trailing_active:
+            trail_price = trade.best_price * (1 + self.config.trailing_stop_pct / 100)
+            if current_price >= trail_price:
+                return "trailing_stop"
 
         # 3. Lower BB exit
         prices = list(self.price_history[asset])
@@ -360,6 +356,7 @@ class RSIBBStrategy:
             size=size,
             stop_loss_price=sl_price,
             best_price=current_price,
+            trailing_active=False,
         )
         self.active_trades[asset]._entry_rsi = entry_rsi
 
@@ -406,7 +403,7 @@ class RSIBBStrategy:
             logger.info(
                 f"{asset}: ENTERED SHORT @ {fill_price:.2f}, RSI: {entry_rsi:.1f}, "
                 f"Size: ${notional:.0f} ({self.active_trades[asset].size:.4f}), SL: {sl_price:.2f}, "
-                f"Max Hold: {self.config.max_hold_seconds // 60}min"
+                f"Trail: {self.config.trailing_stop_pct}%@{self.config.trailing_activation_pct}%"
             )
 
         except Exception as e:
@@ -626,6 +623,7 @@ class RSIBBStrategy:
                         size=real_short.size,
                         stop_loss_price=sl_price,
                         best_price=current_price,
+                        trailing_active=False,
                     )
                     self.active_trades[asset]._entry_rsi = 0
 
@@ -676,12 +674,10 @@ class RSIBBStrategy:
         """Run strategy loop for a single asset."""
         client = self.clients[asset]
 
-        logger.info(f"{asset}: Starting RSI+BB strategy (RSI entry > {self.rsi_entry.get(asset, 70)}) - using shared JSON prices")
+        logger.info(f"{asset}: Starting RSI+BB strategy (RSI entry > {self.rsi_entry.get(asset, 70)})")
         log_counter = 0
         first_bbo = True
         dust_check_counter = 0
-        consecutive_network_errors = 0
-        consecutive_stale_prices = 0
 
         while self.running:
             # Check if halted
@@ -690,33 +686,11 @@ class RSIBBStrategy:
                 await asyncio.sleep(30)  # Check less frequently when halted
                 continue
             try:
-                # Read price from shared JSON instead of API call
-                if not is_price_fresh(asset, max_age=PRICE_MAX_AGE):
-                    consecutive_stale_prices += 1
-                    if consecutive_stale_prices >= 10:
-                        logger.warning(f"{asset}: Prices stale for too long, is price_fetcher.py running?")
-                        consecutive_stale_prices = 0
-                    await asyncio.sleep(2)
-                    continue
-
-                consecutive_stale_prices = 0
-                bbo_data = get_bbo(asset)
-                mid_price = bbo_data.get("mid", 0)
-                bid_price = bbo_data.get("bid", 0)
-                ask_price = bbo_data.get("ask", 0)
-
-                if mid_price <= 0:
-                    logger.warning(f"{asset}: Invalid price from JSON: {mid_price}")
-                    await asyncio.sleep(2)
-                    continue
-
-                # Reset network error counter on successful operation
-                if consecutive_network_errors > 0:
-                    logger.info(f"{asset}: Network connection restored after {consecutive_network_errors} errors")
-                    consecutive_network_errors = 0
+                bbo = await client.get_bbo()
+                mid_price = (bbo.bid_price + bbo.ask_price) / 2
 
                 if first_bbo:
-                    logger.info(f"{asset}: First price from JSON - Bid: {bid_price:.2f}, Ask: {ask_price:.2f}")
+                    logger.info(f"{asset}: First BBO received - Bid: {bbo.bid_price:.2f}, Ask: {bbo.ask_price:.2f}")
                     first_bbo = False
 
                 trade = self.active_trades[asset]
@@ -725,7 +699,7 @@ class RSIBBStrategy:
                 else:
                     # Log status periodically when not in a trade
                     log_counter += 1
-                    if log_counter >= 2:  # Log every ~20s (2 × 10s)
+                    if log_counter >= 4:  # Log every ~2 minutes (4 * 30s)
                         prices = list(self.price_history[asset])
                         price_count = len(prices)
                         if price_count >= max(self.config.bb_period, self.config.rsi_period + 1):
@@ -742,26 +716,26 @@ class RSIBBStrategy:
 
                 if trade:
                     log_counter += 1
-                    if log_counter >= 6:  # Log every ~18s (6 × 3s)
-                        pnl_pct = (trade.entry_price - bid_price) / trade.entry_price * 100
+                    if log_counter >= 12:  # Log every ~60s
+                        pnl_pct = (trade.entry_price - bbo.bid_price) / trade.entry_price * 100
                         pnl_usd = pnl_pct / 100 * self.config.margin_per_trade * self.config.leverage
-                        hold_sec = (datetime.now() - trade.entry_time).total_seconds()
-                        hold_min = hold_sec / 60
+                        trail_status = "ACTIVE" if trade.trailing_active else "inactive"
+                        trail_price = trade.best_price * (1 + self.config.trailing_stop_pct / 100) if trade.trailing_active else 0
 
                         prices = list(self.price_history[asset])
                         lower_bb, _, _ = self.calculate_bb(prices) if len(prices) >= self.config.bb_period else (None, None, None)
                         lower_str = f"{lower_bb:.2f}" if lower_bb else "N/A"
 
                         logger.info(
-                            f"{asset}: Bid: {bid_price:.2f}, Best: {trade.best_price:.2f}, "
-                            f"Hold: {hold_min:.1f}min, LowerBB: {lower_str}, "
+                            f"{asset}: Bid: {bbo.bid_price:.2f}, Best: {trade.best_price:.2f}, "
+                            f"Trail({trail_status}): {trail_price:.2f}, LowerBB: {lower_str}, "
                             f"SL: {trade.stop_loss_price:.2f}, PnL: ${pnl_usd:+.2f}"
                         )
                         log_counter = 0
                 # Note: log_counter is already incremented and reset in the status logging blocks above
 
                 # Use bid for exit checks when in trade
-                await self.update(asset, bid_price if trade else mid_price)
+                await self.update(asset, bbo.bid_price if trade else mid_price)
 
                 # Periodic dust cleanup when not in trade (every ~5 minutes)
                 if not self.active_trades[asset]:
@@ -772,40 +746,58 @@ class RSIBBStrategy:
 
                 # Fast checks when in trade, slower for entries
                 if self.active_trades[asset]:
-                    await asyncio.sleep(3)  # Reduced from 1s to avoid rate limits
+                    await asyncio.sleep(1)
                 else:
                     await asyncio.sleep(10)
-
-            except NetworkError as e:
-                consecutive_network_errors += 1
-
-                if consecutive_network_errors >= MAX_CONSECUTIVE_NETWORK_ERRORS:
-                    logger.error(f"{asset}: CRITICAL - {consecutive_network_errors} consecutive network errors, halting trading")
-                    self.halted[asset] = True
-                    continue
-
-                # Calculate backoff with exponential increase, capped at max
-                backoff = min(NETWORK_ERROR_BACKOFF_BASE * (2 ** (consecutive_network_errors - 1)), NETWORK_ERROR_BACKOFF_MAX)
-                logger.warning(f"{asset}: Network error ({consecutive_network_errors}/{MAX_CONSECUTIVE_NETWORK_ERRORS}), retrying in {backoff:.1f}s: {e}")
-
-                # Attempt reconnection if many errors
-                if consecutive_network_errors >= 3 and not client.paper_mode:
-                    logger.info(f"{asset}: Attempting reconnection...")
-                    try:
-                        await client.disconnect()
-                        await asyncio.sleep(1)
-                        if await client.connect():
-                            logger.info(f"{asset}: Reconnected successfully")
-                        else:
-                            logger.warning(f"{asset}: Reconnection failed")
-                    except Exception as reconnect_err:
-                        logger.warning(f"{asset}: Reconnection attempt failed: {reconnect_err}")
-
-                await asyncio.sleep(backoff)
 
             except Exception as e:
                 logger.error(f"{asset}: Error in strategy loop: {e}")
                 await asyncio.sleep(5)
+
+    async def _bootstrap_price_history(self):
+        """
+        Bootstrap price history from Binance candles so bot can trade immediately.
+        Uses Binance public API (no auth needed) for reliable candle data.
+        """
+        import time as time_module
+        import aiohttp
+
+        logger.info("Bootstrapping price history from Binance...")
+
+        # Map our assets to Binance symbols
+        binance_symbols = {
+            "BTC": "BTCUSDT",
+            "ETH": "ETHUSDT",
+            "SOL": "SOLUSDT",
+        }
+
+        async with aiohttp.ClientSession() as session:
+            for asset, client in self.clients.items():
+                try:
+                    symbol = binance_symbols.get(asset)
+                    if not symbol:
+                        logger.warning(f"{asset}: No Binance symbol mapping")
+                        continue
+
+                    # Fetch 15 1-minute candles from Binance
+                    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=15"
+                    async with session.get(url) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            # Binance kline format: [open_time, open, high, low, close, volume, ...]
+                            for candle in data:
+                                self.price_history[asset].append(float(candle[1]))  # open
+                                self.price_history[asset].append(float(candle[2]))  # high
+                                self.price_history[asset].append(float(candle[3]))  # low
+                                self.price_history[asset].append(float(candle[4]))  # close
+
+                            self._last_price_time[asset] = time_module.time()
+                            logger.info(f"{asset}: Bootstrapped {len(self.price_history[asset])} prices from {len(data)} Binance candles")
+                        else:
+                            logger.warning(f"{asset}: Binance API returned {resp.status}")
+
+                except Exception as e:
+                    logger.warning(f"{asset}: Failed to bootstrap from Binance: {e}")
 
     async def run(self):
         """Run strategy for all assets."""
@@ -819,17 +811,16 @@ class RSIBBStrategy:
         # This prevents entering duplicate positions if bot restarts with open positions
         await self._check_existing_positions()
 
-        # Calculate warmup time: BB period * price collection interval
-        warmup_time = self.config.bb_period * self._price_collection_interval
+        # Bootstrap price history from candles for immediate trading
+        await self._bootstrap_price_history()
 
         logger.info("=" * 70)
-        logger.info("RSI+BB STRATEGY - Starting (using shared JSON prices)")
+        logger.info("RSI+BB STRATEGY - Starting")
         logger.info("=" * 70)
         logger.info(f"Assets: {list(self.clients.keys())}")
-        logger.info(f"Warmup: Collecting {self.config.bb_period} prices (~{warmup_time}s) before trading")
         logger.info(f"Entry: Price > Upper BB({self.config.bb_period}) AND RSI({self.config.rsi_period}) > threshold")
         logger.info(f"RSI thresholds: {self.rsi_entry}")
-        logger.info(f"Exit: Lower BB OR Max Hold {self.config.max_hold_seconds // 60}min OR SL {self.config.stop_loss_pct}%")
+        logger.info(f"Exit: Trail {self.config.trailing_stop_pct}%@{self.config.trailing_activation_pct}% OR Lower BB OR SL {self.config.stop_loss_pct}%")
         logger.info(f"Position: ${self.config.margin_per_trade} x {self.config.leverage}x = ${self.config.margin_per_trade * self.config.leverage}")
         logger.info("=" * 70)
 
@@ -892,6 +883,7 @@ class RSIBBStrategy:
                             size=pos.size,
                             stop_loss_price=sl_price,
                             best_price=pos.entry_price,  # Unknown, use entry
+                            trailing_active=False,
                         )
                         self.active_trades[asset]._entry_rsi = 0  # Unknown
 

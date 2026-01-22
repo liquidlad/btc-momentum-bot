@@ -1,0 +1,86 @@
+{
+  "capital": {
+    "initial": 35,
+    "currency": "USDC"
+  },
+
+  "leverage": {
+    "max": 50,
+    "default": 20,
+    "reduce_on_drawdown": true
+  },
+
+  "targets": {
+    "daily_volume_multiplier": 1000,
+    "daily_volume_target": 50000,
+    "min_daily_profit_pct": 0.1,
+    "target_trades_per_day": 144
+  },
+
+  "position_limits": {
+    "max_position_notional": 200,
+    "max_position_pct_of_leverage": 100,
+    "max_open_positions": 1,
+    "risk_per_trade_pct": 2.0
+  },
+
+  "stop_loss": {
+    "default_pct": 0.10,
+    "max_pct": 0.15,
+    "use_atr_based": false,
+    "atr_multiplier": 0.5
+  },
+
+  "take_profit": {
+    "tp1_pct": 0.08,
+    "tp1_close_pct": 50,
+    "tp2_pct": 0.15,
+    "tp2_close_pct": 50,
+    "use_trailing": true,
+    "trailing_activation_pct": 0.08,
+    "trailing_distance_pct": 0.05
+  },
+
+  "circuit_breakers": {
+    "max_consecutive_losses": 5,
+    "cooldown_after_losses_seconds": 300,
+    "max_daily_drawdown_pct": 25,
+    "max_daily_trades": 500,
+    "pause_on_large_move_pct": 2.0,
+    "pause_on_large_move_minutes": 5,
+    "max_hourly_losses": 3
+  },
+
+  "drawdown_scaling": {
+    "enabled": true,
+    "thresholds": [
+      {"drawdown_pct": 10, "position_multiplier": 1.0},
+      {"drawdown_pct": 15, "position_multiplier": 0.75},
+      {"drawdown_pct": 20, "position_multiplier": 0.50},
+      {"drawdown_pct": 25, "position_multiplier": 0.0}
+    ]
+  },
+
+  "time_limits": {
+    "max_hold_candles": 10,
+    "force_exit_candles": 20,
+    "exit_if_not_profitable_candles": 5
+  },
+
+  "session_limits": {
+    "max_session_hours": 24,
+    "restart_on_error": true,
+    "max_restart_attempts": 3,
+    "restart_cooldown_minutes": 5
+  },
+
+  "alerts": {
+    "telegram_enabled": false,
+    "telegram_bot_token": "${TELEGRAM_BOT_TOKEN}",
+    "telegram_chat_id": "${TELEGRAM_CHAT_ID}",
+    "alert_on_trade": false,
+    "alert_on_daily_summary": true,
+    "alert_on_circuit_breaker": true,
+    "alert_on_error": true
+  }
+}

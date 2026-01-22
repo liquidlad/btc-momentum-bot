@@ -1,0 +1,23 @@
+{
+  "min_conditions": 3,
+  "ema_fast": 3,
+  "ema_slow": 15,
+  "roc_threshold": 0.05,
+  "volume_multiplier": 1.0,
+  "stop_loss_pct": 0.16,
+  "take_profit_1_pct": 0.35,
+  "take_profit_2_pct": 0.50,
+  "max_hold_candles": 15,
+  "expected_metrics": {
+    "total_return_pct": 155.18,
+    "win_rate": 30.5,
+    "trades_per_day": 22.4,
+    "max_drawdown_pct": 29.46,
+    "trading_days": 90
+  },
+  "fee_assumptions": {
+    "maker_fee": 0.0,
+    "taker_fee": 0.0,
+    "note": "Lighter 0% fees"
+  }
+}

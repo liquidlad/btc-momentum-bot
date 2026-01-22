@@ -1,0 +1,56 @@
+{
+  "strategy_name": "BB_Short_MeanReversion",
+  "description": "Short when price closes above upper Bollinger Band (overbought mean reversion)",
+
+  "entry": {
+    "direction": "SHORT_ONLY",
+    "condition": "close > BB_upper",
+    "bb_period": 20,
+    "bb_std": 2.0
+  },
+
+  "exit": {
+    "stop_loss_pct": 0.30,
+    "take_profit_pct": 0.40,
+    "time_exit": false
+  },
+
+  "assets": {
+    "ETH": {
+      "enabled": true,
+      "expected_metrics": {
+        "win_rate": 46.8,
+        "breakeven_wr": 42.9,
+        "ev_per_trade": 0.0277,
+        "trades_per_day": 19.3,
+        "90d_return": 60.1
+      }
+    },
+    "BTC": {
+      "enabled": true,
+      "expected_metrics": {
+        "win_rate": 46.1,
+        "breakeven_wr": 42.9,
+        "ev_per_trade": 0.0226,
+        "trades_per_day": 14.0,
+        "90d_return": 32.0
+      }
+    },
+    "SOL": {
+      "enabled": true,
+      "expected_metrics": {
+        "win_rate": 46.1,
+        "breakeven_wr": 42.9,
+        "ev_per_trade": 0.0224,
+        "trades_per_day": 22.8,
+        "90d_return": 56.3
+      }
+    }
+  },
+
+  "math_verification": {
+    "breakeven_formula": "SL / (SL + TP) = 0.3 / 0.7 = 42.9%",
+    "edge": "Actual WR (~46%) exceeds breakeven (42.9%) by ~3-4%",
+    "note": "Pure SL/TP exits - no time-based exits needed"
+  }
+}

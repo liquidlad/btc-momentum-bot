@@ -1,0 +1,67 @@
+{
+  "description": "Multi-asset portfolio configuration for BTC, ETH, SOL",
+  "assets": {
+    "BTC": {
+      "enabled": true,
+      "capital": 200,
+      "leverage": 50,
+      "config_file": "config/optimized_params.json",
+      "exchange_markets": {
+        "paradex": "BTC-USD-PERP",
+        "lighter": "BTC-USD"
+      }
+    },
+    "ETH": {
+      "enabled": true,
+      "capital": 200,
+      "leverage": 50,
+      "config_file": "config/optimized_params_eth.json",
+      "exchange_markets": {
+        "paradex": "ETH-USD-PERP",
+        "lighter": "ETH-USD"
+      }
+    },
+    "SOL": {
+      "enabled": false,
+      "capital": 200,
+      "leverage": 50,
+      "config_file": "config/optimized_params_sol.json",
+      "exchange_markets": {
+        "paradex": "SOL-USD-PERP",
+        "lighter": "SOL-USD"
+      },
+      "notes": "DISABLED - Backtest shows 47% max drawdown exceeding 25% limit. Only 7.38% return over 90 days with marginal 1.01 profit factor. Not recommended for live trading."
+    }
+  },
+  "portfolio_risk": {
+    "total_capital": 600,
+    "max_portfolio_drawdown_pct": 25,
+    "max_single_asset_allocation_pct": 40,
+    "correlation_limit": 0.8,
+    "emergency_shutdown_drawdown_pct": 30
+  },
+  "expected_metrics": {
+    "BTC": {
+      "trades_per_day": 54.7,
+      "win_rate": 38.0,
+      "total_return_pct": 150.94,
+      "max_drawdown_pct": 25.3,
+      "profit_factor": 1.07
+    },
+    "ETH": {
+      "trades_per_day": 32.0,
+      "win_rate": 40.49,
+      "total_return_pct": 107.81,
+      "max_drawdown_pct": 22.71,
+      "profit_factor": 1.07
+    },
+    "SOL": {
+      "trades_per_day": 23.1,
+      "win_rate": 42.52,
+      "total_return_pct": 7.38,
+      "max_drawdown_pct": 47.23,
+      "profit_factor": 1.01,
+      "status": "DISABLED_HIGH_RISK"
+    }
+  }
+}
