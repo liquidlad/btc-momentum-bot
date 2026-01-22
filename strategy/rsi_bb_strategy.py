@@ -25,10 +25,18 @@ from typing import Optional, Dict
 from dataclasses import dataclass
 from collections import deque
 import numpy as np
+import sys
 
 from exchange.lighter_client import NetworkError
 
+# Add shared_prices to path for price_reader
+sys.path.insert(0, r"C:\Users\eliha\shared_prices")
+from price_reader import get_price, get_bbo, is_price_fresh
+
 logger = logging.getLogger(__name__)
+
+# Shared price config
+PRICE_MAX_AGE = 15  # seconds - skip trading if price older than this
 
 # Network error handling
 MAX_CONSECUTIVE_NETWORK_ERRORS = 10  # Max before giving up
@@ -681,11 +689,12 @@ class RSIBBStrategy:
         """Run strategy loop for a single asset."""
         client = self.clients[asset]
 
-        logger.info(f"{asset}: Starting RSI+BB strategy (RSI entry > {self.rsi_entry.get(asset, 70)})")
+        logger.info(f"{asset}: Starting RSI+BB strategy (RSI entry > {self.rsi_entry.get(asset, 70)}) - using shared JSON prices")
         log_counter = 0
         first_bbo = True
         dust_check_counter = 0
         consecutive_network_errors = 0
+        consecutive_stale_prices = 0
 
         while self.running:
             # Check if halted
@@ -694,8 +703,25 @@ class RSIBBStrategy:
                 await asyncio.sleep(30)  # Check less frequently when halted
                 continue
             try:
-                bbo = await client.get_bbo()
-                mid_price = (bbo.bid_price + bbo.ask_price) / 2
+                # Read price from shared JSON instead of API call
+                if not is_price_fresh(asset, max_age=PRICE_MAX_AGE):
+                    consecutive_stale_prices += 1
+                    if consecutive_stale_prices >= 10:
+                        logger.warning(f"{asset}: Prices stale for too long, is price_fetcher.py running?")
+                        consecutive_stale_prices = 0
+                    await asyncio.sleep(2)
+                    continue
+
+                consecutive_stale_prices = 0
+                bbo_data = get_bbo(asset)
+                mid_price = bbo_data.get("mid", 0)
+                bid_price = bbo_data.get("bid", 0)
+                ask_price = bbo_data.get("ask", 0)
+
+                if mid_price <= 0:
+                    logger.warning(f"{asset}: Invalid price from JSON: {mid_price}")
+                    await asyncio.sleep(2)
+                    continue
 
                 # Reset network error counter on successful operation
                 if consecutive_network_errors > 0:
@@ -703,7 +729,7 @@ class RSIBBStrategy:
                     consecutive_network_errors = 0
 
                 if first_bbo:
-                    logger.info(f"{asset}: First BBO received - Bid: {bbo.bid_price:.2f}, Ask: {bbo.ask_price:.2f}")
+                    logger.info(f"{asset}: First price from JSON - Bid: {bid_price:.2f}, Ask: {ask_price:.2f}")
                     first_bbo = False
 
                 trade = self.active_trades[asset]
@@ -730,7 +756,7 @@ class RSIBBStrategy:
                 if trade:
                     log_counter += 1
                     if log_counter >= 12:  # Log every ~60s
-                        pnl_pct = (trade.entry_price - bbo.bid_price) / trade.entry_price * 100
+                        pnl_pct = (trade.entry_price - bid_price) / trade.entry_price * 100
                         pnl_usd = pnl_pct / 100 * self.config.margin_per_trade * self.config.leverage
                         trail_status = "ACTIVE" if trade.trailing_active else "inactive"
                         trail_price = trade.best_price * (1 + self.config.trailing_stop_pct / 100) if trade.trailing_active else 0
@@ -740,7 +766,7 @@ class RSIBBStrategy:
                         lower_str = f"{lower_bb:.2f}" if lower_bb else "N/A"
 
                         logger.info(
-                            f"{asset}: Bid: {bbo.bid_price:.2f}, Best: {trade.best_price:.2f}, "
+                            f"{asset}: Bid: {bid_price:.2f}, Best: {trade.best_price:.2f}, "
                             f"Trail({trail_status}): {trail_price:.2f}, LowerBB: {lower_str}, "
                             f"SL: {trade.stop_loss_price:.2f}, PnL: ${pnl_usd:+.2f}"
                         )
@@ -748,7 +774,7 @@ class RSIBBStrategy:
                 # Note: log_counter is already incremented and reset in the status logging blocks above
 
                 # Use bid for exit checks when in trade
-                await self.update(asset, bbo.bid_price if trade else mid_price)
+                await self.update(asset, bid_price if trade else mid_price)
 
                 # Periodic dust cleanup when not in trade (every ~5 minutes)
                 if not self.active_trades[asset]:
