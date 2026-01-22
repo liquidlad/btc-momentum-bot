@@ -845,20 +845,18 @@ class RSIBBStrategy:
                         logger.warning(f"{asset}: No Binance symbol mapping")
                         continue
 
-                    # Fetch 15 1-minute candles from Binance
-                    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=15"
+                    # Fetch 50 1-minute candles from Binance (need 40+ for BB period)
+                    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=50"
                     async with session.get(url) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             # Binance kline format: [open_time, open, high, low, close, volume, ...]
+                            # Only use close prices to avoid artificial OHLC swings in RSI
                             for candle in data:
-                                self.price_history[asset].append(float(candle[1]))  # open
-                                self.price_history[asset].append(float(candle[2]))  # high
-                                self.price_history[asset].append(float(candle[3]))  # low
-                                self.price_history[asset].append(float(candle[4]))  # close
+                                self.price_history[asset].append(float(candle[4]))  # close only
 
                             self._last_price_time[asset] = time_module.time()
-                            logger.info(f"{asset}: Bootstrapped {len(self.price_history[asset])} prices from {len(data)} Binance candles")
+                            logger.info(f"{asset}: Bootstrapped {len(self.price_history[asset])} close prices from {len(data)} Binance candles")
                         else:
                             logger.warning(f"{asset}: Binance API returned {resp.status}")
 
