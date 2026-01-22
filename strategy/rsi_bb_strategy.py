@@ -820,49 +820,6 @@ class RSIBBStrategy:
                 logger.error(f"{asset}: Error in strategy loop: {e}")
                 await asyncio.sleep(5)
 
-    async def _bootstrap_price_history(self):
-        """
-        Bootstrap price history from Binance candles so bot can trade immediately.
-        Uses Binance public API (no auth needed) for reliable candle data.
-        """
-        import time as time_module
-        import aiohttp
-
-        logger.info("Bootstrapping price history from Binance...")
-
-        # Map our assets to Binance symbols
-        binance_symbols = {
-            "BTC": "BTCUSDT",
-            "ETH": "ETHUSDT",
-            "SOL": "SOLUSDT",
-        }
-
-        async with aiohttp.ClientSession() as session:
-            for asset, client in self.clients.items():
-                try:
-                    symbol = binance_symbols.get(asset)
-                    if not symbol:
-                        logger.warning(f"{asset}: No Binance symbol mapping")
-                        continue
-
-                    # Fetch 50 1-minute candles from Binance (need 40+ for BB period)
-                    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=50"
-                    async with session.get(url) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            # Binance kline format: [open_time, open, high, low, close, volume, ...]
-                            # Only use close prices to avoid artificial OHLC swings in RSI
-                            for candle in data:
-                                self.price_history[asset].append(float(candle[4]))  # close only
-
-                            self._last_price_time[asset] = time_module.time()
-                            logger.info(f"{asset}: Bootstrapped {len(self.price_history[asset])} close prices from {len(data)} Binance candles")
-                        else:
-                            logger.warning(f"{asset}: Binance API returned {resp.status}")
-
-                except Exception as e:
-                    logger.warning(f"{asset}: Failed to bootstrap from Binance: {e}")
-
     async def run(self):
         """Run strategy for all assets."""
         self.running = True
@@ -875,13 +832,14 @@ class RSIBBStrategy:
         # This prevents entering duplicate positions if bot restarts with open positions
         await self._check_existing_positions()
 
-        # Bootstrap price history from candles for immediate trading
-        await self._bootstrap_price_history()
+        # Calculate warmup time: BB period * price collection interval
+        warmup_time = self.config.bb_period * self._price_collection_interval
 
         logger.info("=" * 70)
-        logger.info("RSI+BB STRATEGY - Starting")
+        logger.info("RSI+BB STRATEGY - Starting (using shared JSON prices)")
         logger.info("=" * 70)
         logger.info(f"Assets: {list(self.clients.keys())}")
+        logger.info(f"Warmup: Collecting {self.config.bb_period} prices (~{warmup_time}s) before trading")
         logger.info(f"Entry: Price > Upper BB({self.config.bb_period}) AND RSI({self.config.rsi_period}) > threshold")
         logger.info(f"RSI thresholds: {self.rsi_entry}")
         logger.info(f"Exit: Trail {self.config.trailing_stop_pct}%@{self.config.trailing_activation_pct}% OR Lower BB OR SL {self.config.stop_loss_pct}%")
