@@ -366,9 +366,9 @@ btc-momentum-bot/
 
 ### 2026-01-18 (Session 9 - RSI+BB Strategy & Lighter Bug Fixes)
 - **NEW STRATEGY**: RSI + Bollinger Band mean-reversion strategy
-  - Entry: SHORT when price > upper BB(20) AND RSI(7) > threshold
-  - Exit: Lower BB OR trailing stop (0.2% after 0.1% profit) OR stop loss (0.3%)
-  - Per-asset RSI thresholds: BTC > 75, ETH > 60, SOL > 65
+  - Entry: SHORT when price > upper BB(40) AND RSI(7) > 75
+  - Exit: Lower BB OR max hold time (10 min) OR stop loss (0.3%)
+  - RSI threshold: 75 for all assets (BTC, ETH, SOL)
   - **SHORT-ONLY strategy** (does not take long positions)
 
 - **90-Day Backtest Results (SHORT strategy)**:
@@ -445,8 +445,8 @@ btc-momentum-bot/
   | Price Collection | Variable | Fixed 10 sec |
 
 - **Position Sizing with 20x**:
-  - $100 margin × 20x = $2,000 notional per trade
-  - Max loss: 0.3% × $2,000 = $6.00 per trade
+  - $40 margin × 20x = $800 notional per trade
+  - Max loss: 0.3% × $800 = $2.40 per trade
 
 - **Simplified Shutdown (Ctrl+C)**:
   - Bot now just stops immediately without trying to close positions
@@ -735,6 +735,36 @@ btc-momentum-bot/
   - Sub-accounts share L1 wallet limits
 
   **Status:** NOT IMPLEMENTED - Build when ready to scale to multiple bots
+
+- **STATUS: DEPLOYED**
+
+### 2026-01-22 (Session 15 - Performance Optimization & Margin Adjustment)
+
+- **72-Hour Performance Analysis Results**:
+  - 455 trades, $88.59 profit, 61.1% win rate
+  - By asset: BTC best ($39.29), SOL weakest ($16.64)
+  - Key finding: Trailing stops were losing money (71% of trailing exits were losses)
+  - Trades held >10 minutes had negative PnL
+  - RSI entries >75 were most profitable
+
+- **Strategy Changes**:
+  | Change | Old | New |
+  |--------|-----|-----|
+  | Trailing Stop | 0.2% after 0.1% profit | **REMOVED** |
+  | Max Hold Time | None | 10 minutes |
+  | RSI Entry (all assets) | BTC:75, ETH:60, SOL:65 | 75 for all |
+  | Margin per trade | $100 | $40 |
+
+- **Rationale**:
+  - Trailing stop at 0.2% was too tight for crypto volatility
+  - Giving back 0.23% average on trailing exits vs 0.05% average on stop losses
+  - 10-min max hold prevents extended losing positions
+  - RSI >75 had best profit/trade ratio across all assets
+  - Reduced margin to balance portfolio with other bots
+
+- **Files Modified**:
+  - `strategy/rsi_bb_strategy.py` - Removed trailing stop, added max_hold_seconds, margin $40
+  - `run_rsi_bb.py` - Updated config, --size default to 40
 
 - **STATUS: DEPLOYED**
 

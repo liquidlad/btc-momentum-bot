@@ -74,7 +74,7 @@ class RSIBBConfig:
     max_hold_seconds: int = 600  # 10 minutes max hold time
 
     # Position sizing
-    margin_per_trade: float = 100.0
+    margin_per_trade: float = 40.0  # $800 notional at 20x
     leverage: float = 20.0
 
 
