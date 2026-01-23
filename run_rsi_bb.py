@@ -2,21 +2,12 @@
 """
 RSI+BB Bot
 
-RSI + Bollinger Band Strategy with Trailing Stop
+RSI + Bollinger Band Strategy
 
-Entry: SHORT when price > upper BB AND RSI > threshold
-Exit: Trailing stop (0.2% after 0.1% profit) OR lower BB OR stop loss
+Entry: SHORT when price > upper BB AND RSI > 75
+Exit: Lower BB OR max hold time (10 min) OR stop loss (0.3%)
 
-Optimized parameters:
-- BTC: RSI > 75
-- ETH: RSI > 60
-- SOL: RSI > 65
-
-90-day backtest results ($100 margin x 20x = $2000 per trade):
-- BTC: $1,013 PnL, 56% WR, 41% MaxDD
-- ETH: $1,371 PnL, 52% WR, 44% MaxDD
-- SOL: $1,792 PnL, 52% WR, 51% MaxDD
-- TOTAL: $4,176 PnL
+RSI threshold: 75 for all assets (BTC, ETH, SOL)
 
 Usage:
     python run_rsi_bb.py              # Paper trading
@@ -81,14 +72,8 @@ async def main(args):
     logger.info("=" * 70)
     logger.info("")
     logger.info("Strategy:")
-    logger.info("  Entry: SHORT when price > upper BB(20) AND RSI(7) > threshold")
-    logger.info("  RSI thresholds: BTC > 75, ETH > 60, SOL > 65")
-    logger.info("  Exit: Trailing stop 0.2%@0.1% OR Lower BB OR SL 0.3%")
-    logger.info("")
-    logger.info("Expected (90-day backtest):")
-    logger.info("  BTC: $1,013 PnL, 56% WR, 41% MaxDD")
-    logger.info("  ETH: $1,371 PnL, 52% WR, 44% MaxDD")
-    logger.info("  SOL: $1,792 PnL, 52% WR, 51% MaxDD")
+    logger.info("  Entry: SHORT when price > upper BB(40) AND RSI(7) > 75")
+    logger.info("  Exit: Lower BB OR Max Hold 10min OR SL 0.3%")
     logger.info("")
     logger.info("=" * 70)
 
@@ -107,17 +92,16 @@ async def main(args):
         bb_std=2.0,
         rsi_period=7,
         stop_loss_pct=0.30,
-        trailing_stop_pct=0.20,
-        trailing_activation_pct=0.10,
+        max_hold_seconds=600,  # 10 minutes
         margin_per_trade=args.size,
         leverage=20.0,
     )
 
-    # Per-asset RSI entry thresholds
+    # Per-asset RSI entry thresholds (all 75 based on performance analysis)
     rsi_entry_overrides = {
         "BTC": 75,
-        "ETH": 60,
-        "SOL": 65,
+        "ETH": 75,
+        "SOL": 75,
     }
 
     # Create strategy
