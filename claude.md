@@ -753,7 +753,7 @@ btc-momentum-bot/
   | Trailing Stop | 0.2% after 0.1% profit | **REMOVED** |
   | Max Hold Time | None | 10 minutes |
   | RSI Entry (all assets) | BTC:75, ETH:60, SOL:65 | 75 for all |
-  | Margin per trade | $100 | $40 |
+  | Margin per trade | $100 | $20 |
 
 - **Rationale**:
   - Trailing stop at 0.2% was too tight for crypto volatility
@@ -761,6 +761,11 @@ btc-momentum-bot/
   - 10-min max hold prevents extended losing positions
   - RSI >75 had best profit/trade ratio across all assets
   - Reduced margin to balance portfolio with other bots
+
+### 2026-01-22 (Session 16 - Margin Reduction)
+- Reduced margin per trade from $40 to $20
+- New position size: $20 x 20x = $400 notional per trade
+- Updated run_rsi_bb.py default and RSIBBConfig
 
 - **Files Modified**:
   - `strategy/rsi_bb_strategy.py` - Removed trailing stop, added max_hold_seconds, margin $40

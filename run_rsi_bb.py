@@ -131,7 +131,7 @@ async def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="RSI+BB Bot")
     parser.add_argument("--live", action="store_true", help="Enable live trading (default: paper)")
-    parser.add_argument("--assets", type=str, default="BTC,ETH,SOL", help="Comma-separated assets (default: BTC,ETH,SOL)")
+    parser.add_argument("--assets", type=str, default="BTC", help="Comma-separated assets (default: BTC)")
     parser.add_argument("--size", type=float, default=20.0, help="Margin size in USD per asset (default: 20)")
 
     args = parser.parse_args()
